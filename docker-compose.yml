@@ -1,0 +1,49 @@
+# Alaka local development / CI infrastructure.
+#
+# LOCAL DEV AND CI ONLY. The credentials below (postgres / alaka_dev_only) are
+# throwaway values for a database that lives on a developer machine or a CI
+# runner. They are deliberately committed, must never be reused anywhere else,
+# and nothing in this file is suitable for a production deployment.
+#
+# Host ports are non-default on purpose so this stack does not collide with a
+# Postgres already listening on 5432:
+#   54329 -> postgres:5432    direct connection
+#   54330 -> toxiproxy:54330  reserved for a future Postgres proxy listener
+#                             (no proxy is configured yet; nothing listens
+#                             there until one is created via the API)
+#   8474  -> toxiproxy:8474   Toxiproxy HTTP API
+
+name: alaka
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: alaka-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: alaka_dev_only
+      POSTGRES_DB: alaka
+    ports:
+      - "54329:5432"
+    volumes:
+      - alaka-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d alaka"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    container_name: alaka-toxiproxy
+    command: ["-host=0.0.0.0", "-port=8474"]
+    ports:
+      - "8474:8474"
+      - "54330:54330"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  alaka-pgdata:
