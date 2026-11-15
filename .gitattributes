@@ -1,0 +1,5 @@
+# core.autocrlf=true on Windows would check mvnw out with CRLF and break it under Git Bash / Linux CI.
+mvnw    text eol=lf
+*.sh    text eol=lf
+*.cmd   text eol=crlf
+*.jar   binary

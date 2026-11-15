@@ -1,1 +1,27 @@
 CLAUDE.md
+# --- Build output (Maven) ---
+target/
+
+# --- TLC model-checker output ---
+# state/fingerprint directories TLC writes next to the spec (any depth)
+states/
+# generated counterexample trace specs and their binary dumps
+*_TTrace_*.tla
+*_TTrace_*.bin
+# captured TLC console logs
+*.tla.out
+
+# --- Partial downloads (e.g. tools/tla2tools.jar.part) ---
+*.part
+
+# --- IDE ---
+.idea/
+*.iml
+.vscode/
+
+# --- Local environment / secrets ---
+.env
+
+# --- OS junk ---
+Thumbs.db
+.DS_Store
