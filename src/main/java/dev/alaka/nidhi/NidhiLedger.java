@@ -65,8 +65,20 @@ public final class NidhiLedger {
     private final Map<UUID, Map<Bucket, UUID>> accountsByMandate = new ConcurrentHashMap<>();
 
     /**
-     * Inserts an {@code ACTIVE} mandate valid from {@code NOW()} for {@code validFor}; the schema
-     * creates its three accounts and its full available balance.
+     * How far {@code not_before} is backdated for a mandate meant to be valid immediately.
+     *
+     * <p>Different PostgreSQL backends can read clocks that disagree: on a Hyper-V / WSL2 host a
+     * backend was measured reading 278 ms behind a timestamp another backend had already
+     * committed. A mandate stamped {@code not_before = NOW()} by one backend could then be "not yet
+     * valid" for a reservation on another. Backdating grants nothing: a mandate cannot be used
+     * before its row exists.
+     */
+    public static final java.time.Duration CLOCK_SKEW_ALLOWANCE = java.time.Duration.ofSeconds(5);
+
+    /**
+     * Inserts an {@code ACTIVE} mandate valid from {@code NOW()} (backdated by
+     * {@link #CLOCK_SKEW_ALLOWANCE}) until {@code NOW() + validFor}; the schema creates its three
+     * accounts and its full available balance.
      *
      * @param c connection
      * @param terms mandate terms
@@ -76,8 +88,9 @@ public final class NidhiLedger {
     public UUID insertMandate(Connection c, NewMandate terms) throws SQLException {
         try (PreparedStatement ps = c.prepareStatement(
                 "INSERT INTO spend_mandates (agent_id, currency, total_budget_minor, max_per_tx_minor,"
-                        + " allowed_merchants, expires_at, token_kid)"
-                        + " VALUES (?, ?, ?, ?, ?, NOW() + ? * INTERVAL '1 millisecond', ?)"
+                        + " allowed_merchants, not_before, expires_at, token_kid)"
+                        + " VALUES (?, ?, ?, ?, ?, NOW() - " + CLOCK_SKEW_ALLOWANCE.toMillis() + " * INTERVAL '1 millisecond',"
+                        + " NOW() + ? * INTERVAL '1 millisecond', ?)"
                         + " RETURNING mandate_id")) {
             Array merchants = c.createArrayOf("text", terms.allowedMerchants().toArray());
             ps.setString(1, terms.agentId());

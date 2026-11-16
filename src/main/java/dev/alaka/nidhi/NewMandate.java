@@ -9,7 +9,9 @@ import java.util.Objects;
  *
  * <p>The validity window is expressed as a duration, not as instants, because invariant I4
  * requires every time check to use PostgreSQL transaction time: the mandate is valid from
- * {@code NOW()} to {@code NOW() + validFor} as evaluated by the database.
+ * {@code NOW()} to {@code NOW() + validFor} as evaluated by the database ({@code not_before} is
+ * backdated by {@link NidhiLedger#CLOCK_SKEW_ALLOWANCE} to absorb clock disagreement between
+ * database backends).
  *
  * @param agentId agent the mandate is issued to
  * @param currency ISO 4217 currency code, three upper-case letters

@@ -73,8 +73,8 @@ run_wave() {
     tag="$(date +%s)$RANDOM"
     agent="conc-$name-$tag"
     mandate="$(app -c "INSERT INTO spend_mandates (agent_id, currency, total_budget_minor, max_per_tx_minor,
-                           allowed_merchants, expires_at, token_kid)
-                       VALUES ('$agent', 'USD', $BUDGET, $AMOUNT, ARRAY['merchant-a'], NOW() + INTERVAL '1 hour', 'kid-conc')
+                           allowed_merchants, not_before, expires_at, token_kid)
+                       VALUES ('$agent', 'USD', $BUDGET, $AMOUNT, ARRAY['merchant-a'], NOW() - INTERVAL '5 seconds', NOW() + INTERVAL '1 hour', 'kid-conc')
                        RETURNING mandate_id" | tr -d '\r' | head -n 1)"
     accounts="$(app -c "SELECT string_agg(account_id::text, ' ' ORDER BY bucket) FROM ledger_accounts
                         WHERE mandate_id = '$mandate' AND bucket IN ('MANDATE_AVAILABLE', 'MANDATE_HELD')" | tr -d '\r')"
