@@ -28,7 +28,9 @@ services:
     volumes:
       - alaka-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d alaka"]
+      # -h 127.0.0.1: probe over TCP, which the image's temporary init server (unix socket only)
+      # does not answer, so "healthy" cannot be reported before the post-init restart.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d alaka"]
       interval: 2s
       timeout: 3s
       retries: 30

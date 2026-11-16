@@ -1,5 +1,9 @@
 # core.autocrlf=true on Windows would check mvnw out with CRLF and break it under Git Bash / Linux CI.
 mvnw    text eol=lf
 *.sh    text eol=lf
+# Shipped into the Linux Postgres container by the concurrency probe and fed to psql / busybox awk.
+*.sql   text eol=lf
+*.awk   text eol=lf
+Makefile text eol=lf
 *.cmd   text eol=crlf
 *.jar   binary

@@ -42,6 +42,10 @@
 
     <start-class>dev.alaka.core.AlakaApplication</start-class>
 
+    <!-- Build output directory. Override with -Dalaka.buildDir=target-<name> to run several
+         builds of the same checkout side by side without them deleting each other's output. -->
+    <alaka.buildDir>${project.basedir}/target</alaka.buildDir>
+
     <!-- Overrides of versions managed by the Spring Boot BOM (property names are Boot's own). -->
     <junit-jupiter.version>5.14.4</junit-jupiter.version>
     <testcontainers.version>2.0.5</testcontainers.version>
@@ -149,6 +153,7 @@
   </dependencies>
 
   <build>
+    <directory>${alaka.buildDir}</directory>
     <plugins>
       <!-- Fail fast on an unsuitable build environment and on non-reproducible dependency versions. -->
       <plugin>
