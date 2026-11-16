@@ -1,0 +1,258 @@
+package dev.alaka.core.http;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.alaka.core.AlakaApplication;
+import dev.alaka.mudra.MudraMandateClaims;
+import dev.alaka.mudra.MudraTokenSigner;
+import dev.alaka.testsupport.NidhiPostgres;
+import dev.alaka.yaksha.ConfirmBehavior;
+import dev.alaka.yaksha.MockStripeServer;
+import dev.alaka.yaksha.RailPaymentIntent;
+import dev.alaka.yaksha.StripeWebhookVerifier;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.UUID;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
+
+/**
+ * The real Spring Boot application, started on a random port against PostgreSQL 16 (as
+ * {@code alaka_app}) and {@link MockStripeServer}, driven over HTTP: status codes, headers and the
+ * end-to-end flow from mandate registration to webhook settlement.
+ */
+class AlakaHttpControllerTest {
+
+    private static final String API_KEY = "sk_test_http";
+    private static final String WEBHOOK_SECRET = "whsec_http";
+    private static final String MERCHANT = "merchant-a";
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final HttpClient HTTP = HttpClient.newHttpClient();
+
+    private static MockStripeServer stripe;
+    private static ConfigurableApplicationContext app;
+    private static URI base;
+    private static MudraTokenSigner signer;
+
+    @BeforeAll
+    static void startApplication() throws NoSuchAlgorithmException {
+        KeyPair issuer = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+        signer = new MudraTokenSigner("kid-http", issuer.getPrivate());
+        stripe = new MockStripeServer(API_KEY);
+        NidhiPostgres db = NidhiPostgres.shared().isolatedDatabase("alaka_http");
+        app = new SpringApplicationBuilder(AlakaApplication.class).run(
+                "--server.port=0",
+                "--alaka.mode=hardened-pessimistic",
+                "--alaka.db.url=" + db.jdbcUrl(),
+                "--alaka.db.username=alaka_app",
+                "--alaka.db.password=alaka_app_dev_only",
+                "--alaka.stripe.base-url=" + stripe.baseUrl(),
+                "--alaka.stripe.secret-key=" + API_KEY,
+                "--alaka.stripe.webhook-secret=" + WEBHOOK_SECRET,
+                "--alaka.stripe.confirm-payment-method=pm_card_visa",
+                "--alaka.stripe.request-timeout=5s",
+                "--alaka.mudra.trusted-keys.kid-http=" + Base64.getEncoder().encodeToString(issuer.getPublic().getEncoded()),
+                "--alaka.recovery.sweep-interval=0s");
+        base = URI.create("http://127.0.0.1:" + app.getEnvironment().getProperty("local.server.port"));
+    }
+
+    @AfterAll
+    static void stopApplication() {
+        app.close();
+        stripe.close();
+    }
+
+    private record Reply(int status, JsonNode body, HttpResponse<String> raw) {
+    }
+
+    private static Reply post(String path, String token, String json) throws IOException, InterruptedException {
+        HttpRequest.Builder request = HttpRequest.newBuilder(base.resolve(path))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json));
+        if (token != null) {
+            request.header("X-Mudra-Token", token);
+        }
+        HttpResponse<String> response = HTTP.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        JsonNode body = response.body().isEmpty() ? JSON.missingNode() : JSON.readTree(response.body());
+        return new Reply(response.statusCode(), body, response);
+    }
+
+    private static String spendJson(UUID mandate, String agent, String key, String merchant, long amount, long quoted) {
+        return JSON.createObjectNode()
+                .put("mandate_id", mandate.toString())
+                .put("agent_id", agent)
+                .put("idempotency_key", key)
+                .put("merchant_id", merchant)
+                .put("currency", "USD")
+                .put("amount_minor", amount)
+                .<com.fasterxml.jackson.databind.node.ObjectNode>set("quote", JSON.createObjectNode()
+                        .put("merchant_id", merchant)
+                        .put("currency", "USD")
+                        .put("quoted_amount_minor", quoted)
+                        .put("max_slippage_bps", 100)
+                        .put("expires_at", Instant.now().plusSeconds(300).toString()))
+                .toString();
+    }
+
+    /** A mandate valid from a minute ago: the signer's clock may run ahead of the database's NOW(). */
+    private static String token(UUID mandate, String agent, List<String> merchants) {
+        long now = Instant.now().getEpochSecond();
+        return signer.sign(new MudraMandateClaims(mandate, agent, "USD", 10_000, 5_000, merchants, now - 60,
+                now + 3_600, "kid-http"));
+    }
+
+    private static Reply register(String token) throws IOException, InterruptedException {
+        return post("/v1/mandates", null, JSON.createObjectNode().put("token", token).toString());
+    }
+
+    @Test
+    void endToEndSpendIdempotencyAndBudgetStatusCodes() throws Exception {
+        UUID mandate = UUID.randomUUID();
+        String agent = "agent-" + UUID.randomUUID();
+        String token = token(mandate, agent, List.of(MERCHANT, "merchant-evil-but-signed"));
+
+        Reply registered = register(token);
+        assertThat(registered.status()).isEqualTo(201);
+        assertThat(registered.body().path("mandate_id").asText()).isEqualTo(mandate.toString());
+        assertThat(register(token).status()).as("already registered").isEqualTo(409);
+
+        Reply spent = post("/v1/spends", token, spendJson(mandate, agent, "k1", MERCHANT, 4_000, 4_000));
+        assertThat(spent.status()).isEqualTo(200);
+        assertThat(spent.body().path("status").asText()).isEqualTo("CAPTURED");
+        assertThat(spent.body().path("captured_amount_minor").asLong()).isEqualTo(4_000);
+        assertThat(spent.body().path("replayed").asBoolean()).isFalse();
+
+        Reply replay = post("/v1/spends", token, spendJson(mandate, agent, "k1", MERCHANT, 4_000, 4_000));
+        assertThat(replay.status()).isEqualTo(200);
+        assertThat(replay.body().path("replayed").asBoolean()).isTrue();
+        assertThat(replay.body().path("intent_id").asText()).isEqualTo(spent.body().path("intent_id").asText());
+
+        Reply tampered = post("/v1/spends", token, spendJson(mandate, agent, "k1", MERCHANT, 4_001, 4_001));
+        assertThat(tampered.status()).isEqualTo(422);
+        assertThat(tampered.body().path("error").path("code").asText()).isEqualTo("IdempotencyKeyPayloadMismatch");
+
+        Reply overCap = post("/v1/spends", token, spendJson(mandate, agent, "k2", MERCHANT, 5_001, 5_001));
+        assertThat(overCap.status()).as("per-tx cap 5000").isEqualTo(402);
+        assertThat(overCap.body().path("error").path("code").asText()).isEqualTo("SG003");
+        assertThat(post("/v1/spends", token, spendJson(mandate, agent, "k3", MERCHANT, 5_000, 5_000)).status())
+                .isEqualTo(200);
+        Reply overdraw = post("/v1/spends", token, spendJson(mandate, agent, "k4", MERCHANT, 1_001, 1_001));
+        assertThat(overdraw.status()).as("only 1000 left").isEqualTo(402);
+
+        Reply drift = post("/v1/spends", token, spendJson(mandate, agent, "k5", MERCHANT, 1_000, 900));
+        assertThat(drift.status()).isEqualTo(422);
+        assertThat(drift.body().path("error").path("code").asText()).isEqualTo("QuoteDrift.PRICE");
+    }
+
+    @Test
+    void tokenAndMandateRejections() throws Exception {
+        UUID mandate = UUID.randomUUID();
+        String agent = "agent-" + UUID.randomUUID();
+        String token = token(mandate, agent, List.of(MERCHANT));
+        assertThat(register(token).status()).isEqualTo(201);
+
+        String forged = new MudraTokenSigner("kid-http",
+                KeyPairGenerator.getInstance("Ed25519").generateKeyPair().getPrivate()).sign(
+                forgedClaims(mandate, agent, 1_000_000));
+        Reply badToken = post("/v1/spends", forged, spendJson(mandate, agent, "k1", MERCHANT, 100, 100));
+        assertThat(badToken.status()).isEqualTo(422);
+        assertThat(badToken.body().path("error").path("code").asText()).isEqualTo("BadSignature");
+        assertThat(register(forged).status()).isEqualTo(422);
+
+        assertThat(post("/v1/spends", null, spendJson(mandate, agent, "k1", MERCHANT, 100, 100)).status())
+                .as("missing X-Mudra-Token").isEqualTo(400);
+
+        Reply merchant = post("/v1/spends", token, spendJson(mandate, agent, "k2", "merchant-other", 100, 100));
+        assertThat(merchant.status()).isEqualTo(403);
+        assertThat(merchant.body().path("error").path("code").asText()).isEqualTo("SG008");
+
+        assertThat(post("/v1/mandates/" + mandate + "/revoke", null, "{\"reason\":\"compromised\"}").status())
+                .isEqualTo(200);
+        Reply revoked = post("/v1/spends", token, spendJson(mandate, agent, "k3", MERCHANT, 100, 100));
+        assertThat(revoked.status()).isEqualTo(403);
+        assertThat(revoked.body().path("error").path("code").asText()).isEqualTo("SG001");
+        assertThat(post("/v1/mandates/" + mandate + "/revoke", null, "{}").status()).as("terminal").isEqualTo(409);
+        assertThat(post("/v1/mandates/" + UUID.randomUUID() + "/revoke", null, "{}").status()).isEqualTo(404);
+    }
+
+    @Test
+    void processingSpendAnswers202Then409WithRetryAfterAndSettlesByWebhook() throws Exception {
+        UUID mandate = UUID.randomUUID();
+        String agent = "agent-" + UUID.randomUUID();
+        String token = token(mandate, agent, List.of(MERCHANT));
+        assertThat(register(token).status()).isEqualTo(201);
+        String body = spendJson(mandate, agent, "k1", MERCHANT, 3_000, 3_000);
+
+        stripe.state.setDefaultConfirmBehavior(ConfirmBehavior.enterProcessing());
+        Reply accepted;
+        try {
+            accepted = post("/v1/spends", token, body);
+        } finally {
+            stripe.state.setDefaultConfirmBehavior(ConfirmBehavior.succeedFull());
+        }
+        assertThat(accepted.status()).isEqualTo(202);
+        assertThat(accepted.body().path("status").asText()).isEqualTo("CONFIRMING");
+
+        Reply inFlight = post("/v1/spends", token, body);
+        assertThat(inFlight.status()).isEqualTo(409);
+        assertThat(inFlight.raw().headers().firstValue("Retry-After")).hasValue("1");
+        assertThat(inFlight.body().path("error").path("code").asText()).isEqualTo("IdempotencyKeyInFlight");
+
+        // Stripe resolves the payment and tells us by webhook.
+        String piId = accepted.body().path("rail_payment_intent_id").asText();
+        RailPaymentIntent succeeded = stripe.state.resolveProcessingAsSucceeded(piId, 0);
+        String eventId = "evt_" + UUID.randomUUID();
+        byte[] event = MockStripeServer.eventJson(eventId, "payment_intent.succeeded", succeeded);
+        StripeWebhookVerifier signing = new StripeWebhookVerifier(WEBHOOK_SECRET,
+                StripeWebhookVerifier.DEFAULT_TOLERANCE, Clock.systemUTC());
+        long t = Instant.now().getEpochSecond();
+        String signature = "t=" + t + ",v1=" + HexFormat.of().formatHex(signing.sign(t, event));
+
+        Reply applied = webhook(signature, event);
+        assertThat(applied.status()).isEqualTo(200);
+        assertThat(applied.body().path("disposition").asText()).isEqualTo("APPLIED");
+        assertThat(webhook(signature, event).body().path("disposition").asText()).isEqualTo("DUPLICATE");
+        Reply forged = webhook("t=" + t + ",v1=" + "00".repeat(32), event);
+        assertThat(forged.status()).isEqualTo(400);
+        assertThat(forged.body().path("error").path("code").asText()).isEqualTo("BAD_SIGNATURE");
+        assertThat(webhook(null, event).status()).isEqualTo(400);
+
+        Reply settled = post("/v1/spends", token, body);
+        assertThat(settled.status()).isEqualTo(200);
+        assertThat(settled.body().path("status").asText()).isEqualTo("CAPTURED");
+        assertThat(settled.body().path("replayed").asBoolean()).isTrue();
+    }
+
+    private static Reply webhook(String signature, byte[] event) throws IOException, InterruptedException {
+        HttpRequest.Builder request = HttpRequest.newBuilder(base.resolve("/v1/webhooks/stripe"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(event));
+        if (signature != null) {
+            request.header("Stripe-Signature", signature);
+        }
+        HttpResponse<String> response = HTTP.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        return new Reply(response.statusCode(), JSON.readTree(response.body()), response);
+    }
+
+    private static MudraMandateClaims forgedClaims(UUID mandate, String agent, long budget) {
+        long now = Instant.now().getEpochSecond();
+        return new MudraMandateClaims(mandate, agent, "USD", budget, 5_000, List.of(MERCHANT), now - 60, now + 3_600,
+                "kid-http");
+    }
+}
