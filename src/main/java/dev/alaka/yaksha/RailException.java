@@ -48,6 +48,18 @@ public abstract sealed class RailException extends RuntimeException {
         }
     }
 
+    /**
+     * {@code /confirm} was declined (Stripe: HTTP 402 {@code card_error}). No money moved and the
+     * payment intent is back in a cancelable state; recovery cancels it before voiding.
+     */
+    public static final class Declined extends RailException {
+        private static final long serialVersionUID = 1L;
+
+        public Declined(String message) {
+            super(message);
+        }
+    }
+
     /** {@code /confirm} was rejected because the payment intent is already {@code CANCELED}. */
     public static final class ConfirmRejected extends RailException {
         private static final long serialVersionUID = 1L;

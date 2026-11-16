@@ -4,6 +4,7 @@ import dev.alaka.nidhi.IntentView;
 import dev.alaka.nidhi.MandateBalances;
 import dev.alaka.nidhi.NewMandate;
 import dev.alaka.nidhi.NidhiException;
+import dev.alaka.nidhi.SignedMandateTerms;
 import dev.alaka.yaksha.RailException;
 import dev.alaka.yaksha.RailPaymentIntent;
 import java.util.List;
@@ -43,6 +44,17 @@ public interface SpendEngine {
     UUID createMandate(NewMandate terms);
 
     /**
+     * Creates an {@code ACTIVE} mandate whose id and validity window were fixed by a verified
+     * capability token. Validity is still judged by the database's {@code NOW()} on every
+     * reservation (I4).
+     *
+     * @param terms the signed terms
+     * @return the mandate id, {@code terms.mandateId()}
+     * @throws NidhiException.UniqueViolation if a mandate with that id already exists
+     */
+    UUID createMandate(SignedMandateTerms terms);
+
+    /**
      * Revokes a mandate. Irreversible (I4); reservations already made are unaffected and can
      * still be captured or voided.
      *
@@ -55,7 +67,10 @@ public interface SpendEngine {
     /**
      * Phase 1: one local database transaction, no network I/O. Passes the idempotency gate, then
      * inserts the intent in {@code RESERVED} together with its {@code RESERVE} ledger transaction
-     * and postings ({@code DEBIT MANDATE_AVAILABLE}, {@code CREDIT MANDATE_HELD}), and commits.
+     * and postings ({@code DEBIT MANDATE_AVAILABLE}, {@code CREDIT MANDATE_HELD}) and its recovery
+     * task in {@code outbox_tasks}, and commits. The task falls due once the request has had the
+     * engine's recovery grace period to finish; the transaction that settles the intent completes
+     * it.
      *
      * <p>Idempotency gate, for an {@code (agentId, idempotencyKey)} that already exists, including
      * when the existing row was inserted by a concurrent request that won the race:
@@ -136,6 +151,28 @@ public interface SpendEngine {
      *     {@code CONFIRMING} while the rail is processing
      */
     IntentView recoverOrVoid(UUID intentId);
+
+    /**
+     * Applies a rail event whose authenticity the caller has verified (for Stripe, a webhook whose
+     * {@code Stripe-Signature} checked out). The event id is recorded in
+     * {@code processed_webhooks} in the same transaction that applies the event, so a replayed
+     * event is a no-op and an event is never half-applied.
+     * <ul>
+     *   <li>{@code payment_intent.succeeded}: capture exactly the charged amount the event reports.
+     *   <li>{@code payment_intent.canceled}: void.
+     *   <li>{@code payment_intent.payment_failed}: the payment intent returns to a cancelable state,
+     *       not to {@code canceled}, so voiding now would release a hold on a payment intent that
+     *       could still be confirmed. The event is recorded, then {@link #recoverOrVoid} runs, which
+     *       cancels on the rail before it voids.
+     *   <li>any other type, or a payment intent no intent has recorded: recorded and ignored.
+     * </ul>
+     *
+     * @param providerEventId the provider's event id ({@code evt_...})
+     * @param eventType the event type
+     * @param paymentIntent the payment intent as the event reports it
+     * @return what was done
+     */
+    RailEventOutcome applyRailEvent(String providerEventId, String eventType, RailPaymentIntent paymentIntent);
 
     /**
      * Runs a request end to end. In the hardened modes: {@link #reserve}, {@link #createOnRail},
