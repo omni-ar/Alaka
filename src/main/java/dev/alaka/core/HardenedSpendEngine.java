@@ -6,6 +6,7 @@ import dev.alaka.nidhi.MandateBalances;
 import dev.alaka.nidhi.NewMandate;
 import dev.alaka.nidhi.NidhiException;
 import dev.alaka.nidhi.NidhiLedger;
+import dev.alaka.nidhi.SignedMandateTerms;
 import dev.alaka.nidhi.TransactionRunner;
 import dev.alaka.yaksha.PaymentRailPort;
 import dev.alaka.yaksha.RailException;
@@ -50,8 +51,9 @@ final class HardenedSpendEngine implements SpendEngine {
     private final NidhiLedger ledger = new NidhiLedger();
     private final PaymentRailPort rail;
     private final boolean lockBalances;
+    private final long recoveryGraceMillis;
 
-    HardenedSpendEngine(RuntimeMode mode, TransactionRunner tx, PaymentRailPort rail) {
+    HardenedSpendEngine(RuntimeMode mode, TransactionRunner tx, PaymentRailPort rail, EngineOptions options) {
         if (mode == RuntimeMode.NAIVE) {
             throw new IllegalArgumentException("HardenedSpendEngine does not implement " + mode);
         }
@@ -59,6 +61,7 @@ final class HardenedSpendEngine implements SpendEngine {
         this.tx = Objects.requireNonNull(tx, "tx");
         this.rail = new RailCallGuard(rail);
         this.lockBalances = mode == RuntimeMode.HARDENED_PESSIMISTIC;
+        this.recoveryGraceMillis = options.recoveryGrace().toMillis();
     }
 
     @Override
@@ -69,6 +72,15 @@ final class HardenedSpendEngine implements SpendEngine {
     @Override
     public UUID createMandate(NewMandate terms) {
         return tx.inTransaction(c -> ledger.insertMandate(c, terms));
+    }
+
+    @Override
+    public UUID createMandate(SignedMandateTerms terms) {
+        tx.inTransaction(c -> {
+            ledger.insertSignedMandate(c, terms);
+            return null;
+        });
+        return terms.mandateId();
     }
 
     @Override
@@ -128,6 +140,7 @@ final class HardenedSpendEngine implements SpendEngine {
                 IntentStatus.RESERVED,
                 null);
         ledger.insertReservation(c, intent);
+        ledger.enqueueRecovery(c, intent.intentId(), recoveryGraceMillis);
         return new SpendResult(intent, false);
     }
 
@@ -301,6 +314,57 @@ final class HardenedSpendEngine implements SpendEngine {
             ledger.recordVoid(c, locked);
             return ledger.findIntent(c, intentId, false).orElseThrow();
         });
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Verified rail events (webhooks)
+
+    static final String EVENT_SUCCEEDED = "payment_intent.succeeded";
+    static final String EVENT_CANCELED = "payment_intent.canceled";
+    static final String EVENT_PAYMENT_FAILED = "payment_intent.payment_failed";
+
+    @Override
+    public RailEventOutcome applyRailEvent(String providerEventId, String eventType, RailPaymentIntent pi) {
+        Objects.requireNonNull(providerEventId, "providerEventId");
+        Objects.requireNonNull(eventType, "eventType");
+        Objects.requireNonNull(pi, "pi");
+        RailEventOutcome outcome = tx.inTransaction(c -> {
+            Optional<IntentView> known = ledger.findIntentByRailId(c, pi.piId());
+            UUID intentId = known.map(IntentView::intentId).orElse(null);
+            if (!ledger.recordWebhook(c, providerEventId, intentId, eventType)) {
+                return new RailEventOutcome(RailEventOutcome.Disposition.DUPLICATE, known);
+            }
+            if (known.isEmpty()) {
+                // A payment intent no intent recorded: e.g. a late Step 2A packet whose intent was
+                // voided. It is unconfirmed and can never charge; nothing to settle.
+                return new RailEventOutcome(RailEventOutcome.Disposition.IGNORED, known);
+            }
+            boolean succeeded = eventType.equals(EVENT_SUCCEEDED) && pi.status() == RailPiStatus.SUCCEEDED;
+            boolean canceled = eventType.equals(EVENT_CANCELED) && pi.status() == RailPiStatus.CANCELED;
+            if (!succeeded && !canceled) {
+                return new RailEventOutcome(RailEventOutcome.Disposition.IGNORED, known);
+            }
+            IntentView locked = lockForTransition(c, intentId);
+            if (!locked.status().isTerminal()) {
+                if (succeeded) {
+                    ledger.recordCapture(c, locked, pi.chargedMinor());
+                } else {
+                    ledger.recordVoid(c, locked);
+                }
+            } else if (locked.status() != (succeeded ? IntentStatus.CAPTURED : IntentStatus.VOIDED)) {
+                throw new IllegalStateException("Event " + providerEventId + " (" + eventType + ") contradicts intent "
+                        + intentId + " in " + locked.status());
+            }
+            return new RailEventOutcome(
+                    RailEventOutcome.Disposition.APPLIED, ledger.findIntent(c, intentId, false));
+        });
+        if (outcome.disposition() == RailEventOutcome.Disposition.IGNORED
+                && eventType.equals(EVENT_PAYMENT_FAILED) && outcome.intent().isPresent()) {
+            // Recorded; now resolve it the only safe way: cancel on the rail, then void.
+            IntentView recovered = recoverOrVoid(outcome.intent().get().intentId());
+            return new RailEventOutcome(RailEventOutcome.Disposition.APPLIED, Optional.of(recovered));
+        }
+        return outcome;
     }
 
     // ---------------------------------------------------------------------------------------

@@ -36,17 +36,32 @@ public final class SpendEngines {
      * @return a thread-safe engine
      */
     public static SpendEngine create(RuntimeMode mode, DataSource appDataSource, PaymentRailPort rail) {
+        return create(mode, appDataSource, rail, EngineOptions.DEFAULTS);
+    }
+
+    /**
+     * Creates an engine for one runtime mode with explicit options.
+     *
+     * @param mode the runtime mode
+     * @param appDataSource connections authenticated as {@code alaka_app}
+     * @param rail the payment rail
+     * @param options engine tunables (ignored by {@link RuntimeMode#NAIVE})
+     * @return a thread-safe engine
+     */
+    public static SpendEngine create(
+            RuntimeMode mode, DataSource appDataSource, PaymentRailPort rail, EngineOptions options) {
         Objects.requireNonNull(mode, "mode");
         Objects.requireNonNull(appDataSource, "appDataSource");
         Objects.requireNonNull(rail, "rail");
+        Objects.requireNonNull(options, "options");
         return switch (mode) {
             case NAIVE -> new NaiveSpendEngine(
                     new TransactionRunner(appDataSource, Isolation.READ_COMMITTED, new RetryPolicy(1, Duration.ZERO, Duration.ZERO)),
                     rail);
             case HARDENED_PESSIMISTIC -> new HardenedSpendEngine(
-                    mode, new TransactionRunner(appDataSource, Isolation.READ_COMMITTED, PESSIMISTIC_RETRY), rail);
+                    mode, new TransactionRunner(appDataSource, Isolation.READ_COMMITTED, PESSIMISTIC_RETRY), rail, options);
             case HARDENED_SSI -> new HardenedSpendEngine(
-                    mode, new TransactionRunner(appDataSource, Isolation.SERIALIZABLE, SSI_RETRY), rail);
+                    mode, new TransactionRunner(appDataSource, Isolation.SERIALIZABLE, SSI_RETRY), rail, options);
         };
     }
 }

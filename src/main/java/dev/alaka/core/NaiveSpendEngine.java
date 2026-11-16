@@ -6,6 +6,7 @@ import dev.alaka.nidhi.MandateBalances;
 import dev.alaka.nidhi.NewMandate;
 import dev.alaka.nidhi.NidhiException;
 import dev.alaka.nidhi.NidhiLedger;
+import dev.alaka.nidhi.SignedMandateTerms;
 import dev.alaka.nidhi.TransactionRunner;
 import dev.alaka.yaksha.PaymentRailPort;
 import dev.alaka.yaksha.RailException;
@@ -62,6 +63,20 @@ final class NaiveSpendEngine implements SpendEngine {
     @Override
     public UUID createMandate(NewMandate terms) {
         return tx.inTransaction(c -> ledger.insertMandate(c, terms));
+    }
+
+    @Override
+    public UUID createMandate(SignedMandateTerms terms) {
+        tx.inTransaction(c -> {
+            ledger.insertSignedMandate(c, terms);
+            return null;
+        });
+        return terms.mandateId();
+    }
+
+    @Override
+    public RailEventOutcome applyRailEvent(String providerEventId, String eventType, RailPaymentIntent paymentIntent) {
+        throw unsupported("applyRailEvent");
     }
 
     @Override
