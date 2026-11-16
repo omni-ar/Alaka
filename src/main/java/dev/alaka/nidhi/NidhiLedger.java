@@ -95,6 +95,30 @@ public final class NidhiLedger {
     }
 
     /**
+     * Inserts an {@code ACTIVE} mandate with the id and validity window fixed by a signed token.
+     *
+     * @param c connection
+     * @param terms signed mandate terms
+     * @throws SQLException on any database error, including {@code 23505} if the id is taken
+     */
+    public void insertSignedMandate(Connection c, SignedMandateTerms terms) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO spend_mandates (mandate_id, agent_id, currency, total_budget_minor, max_per_tx_minor,"
+                        + " allowed_merchants, not_before, expires_at, token_kid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+            ps.setObject(1, terms.mandateId());
+            ps.setString(2, terms.agentId());
+            ps.setString(3, terms.currency());
+            ps.setLong(4, terms.totalBudgetMinor());
+            ps.setLong(5, terms.maxPerTxMinor());
+            ps.setArray(6, c.createArrayOf("text", terms.allowedMerchants().toArray()));
+            ps.setObject(7, java.time.OffsetDateTime.ofInstant(terms.notBefore(), java.time.ZoneOffset.UTC));
+            ps.setObject(8, java.time.OffsetDateTime.ofInstant(terms.expiresAt(), java.time.ZoneOffset.UTC));
+            ps.setString(9, terms.tokenKid());
+            ps.executeUpdate();
+        }
+    }
+
+    /**
      * Reads a mandate, optionally taking {@code FOR SHARE} (blocks revocation until commit).
      *
      * @param c connection
@@ -338,6 +362,7 @@ public final class NidhiLedger {
         if (chargedMinor < authorized) {
             insertPosting(c, tx, intent, accounts.get(Bucket.MANDATE_AVAILABLE), "CREDIT", authorized - chargedMinor);
         }
+        completeRecovery(c, intent.intentId());
     }
 
     /**
@@ -359,6 +384,84 @@ public final class NidhiLedger {
         long amount = intent.authorizedAmountMinor();
         insertPosting(c, tx, intent, accounts.get(Bucket.MANDATE_HELD), "DEBIT", amount);
         insertPosting(c, tx, intent, accounts.get(Bucket.MANDATE_AVAILABLE), "CREDIT", amount);
+        completeRecovery(c, intent.intentId());
+    }
+
+    /**
+     * Finds the intent that recorded a rail payment intent id.
+     *
+     * @param c connection
+     * @param railPaymentIntentId the rail's {@code pi_...} id
+     * @return the intent, or empty if no intent recorded that id
+     * @throws SQLException on any database error
+     */
+    public Optional<IntentView> findIntentByRailId(Connection c, String railPaymentIntentId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT " + INTENT_COLUMNS + " FROM payment_intents WHERE stripe_payment_intent = ?")) {
+            ps.setString(1, railPaymentIntentId);
+            return single(ps);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Outbox: one recovery task per intent, completed in the transaction that settles it.
+
+    /**
+     * Enqueues the recovery task of a new intent, due once the intent has had {@code graceMillis}
+     * to finish normally. Call in the Phase 1 transaction.
+     *
+     * @param c connection
+     * @param intentId intent id
+     * @param graceMillis how long a healthy request may take before recovery considers it stuck
+     * @throws SQLException on any database error
+     */
+    public void enqueueRecovery(Connection c, UUID intentId, long graceMillis) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO outbox_tasks (intent_id, next_attempt_at) VALUES (?, NOW() + ? * INTERVAL '1 millisecond')")) {
+            ps.setObject(1, intentId);
+            ps.setLong(2, graceMillis);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Marks an intent's recovery task {@code COMPLETED}. Call in the transaction that moves the
+     * intent to a terminal state, so a settled intent never has a live task.
+     *
+     * @param c connection
+     * @param intentId intent id
+     * @throws SQLException on any database error
+     */
+    public void completeRecovery(Connection c, UUID intentId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE outbox_tasks SET status = 'COMPLETED', locked_until = NULL, updated_at = NOW()"
+                        + " WHERE intent_id = ? AND status <> 'COMPLETED'")) {
+            ps.setObject(1, intentId);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Records a provider event as processed. Call in the transaction that applies the event, so
+     * the effect and the dedup marker commit or roll back together.
+     *
+     * @param c connection
+     * @param providerEventId the provider's event id ({@code evt_...})
+     * @param intentId intent the event concerns, or {@code null}
+     * @param eventType event type
+     * @return {@code false} if the event had already been recorded (a replay)
+     * @throws SQLException on any database error
+     */
+    public boolean recordWebhook(Connection c, String providerEventId, UUID intentId, String eventType)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO processed_webhooks (provider_event_id, intent_id, event_type) VALUES (?, ?, ?)"
+                        + " ON CONFLICT (provider_event_id) DO NOTHING")) {
+            ps.setString(1, providerEventId);
+            ps.setObject(2, intentId);
+            ps.setString(3, eventType);
+            return ps.executeUpdate() == 1;
+        }
     }
 
     /**
