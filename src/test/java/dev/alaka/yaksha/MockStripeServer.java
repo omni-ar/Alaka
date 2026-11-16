@@ -29,20 +29,21 @@ import java.util.function.Consumer;
  * timeout faults surface as HTTP 500, which is how Stripe reports a request whose outcome is
  * unknown. Every request is recorded for wire-level assertions.
  */
-final class MockStripeServer implements AutoCloseable {
+public final class MockStripeServer implements AutoCloseable {
 
     /** One recorded request. */
-    record Recorded(String method, String path, Map<String, String> headers, Map<String, String> form) {
+    public record Recorded(String method, String path, Map<String, String> headers, Map<String, String> form) {
     }
 
-    final SimulatedPaymentRail state = new SimulatedPaymentRail();
-    final List<Recorded> requests = new CopyOnWriteArrayList<>();
+    public volatile SimulatedPaymentRail state = new SimulatedPaymentRail();
+    public final List<Recorded> requests = new CopyOnWriteArrayList<>();
+    private volatile boolean closeConnections;
     private final String apiKey;
     private final HttpServer server;
     private volatile Duration confirmResponseDelay = Duration.ZERO;
     private volatile Consumer<RailPaymentIntent> afterConfirmApplied = pi -> { };
 
-    MockStripeServer(String apiKey) {
+    public MockStripeServer(String apiKey) {
         this.apiKey = apiKey;
         try {
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -54,21 +55,40 @@ final class MockStripeServer implements AutoCloseable {
         server.start();
     }
 
-    URI baseUrl() {
+    public URI baseUrl() {
         return URI.create("http://127.0.0.1:" + server.getAddress().getPort());
     }
 
+    /**
+     * Forgets every payment intent and recorded request, and clears the delay and hook, so one
+     * server (and the proxy in front of it) can serve several tests.
+     */
+    public void resetState() {
+        state = new SimulatedPaymentRail();
+        requests.clear();
+        confirmResponseDelay = Duration.ZERO;
+        afterConfirmApplied = pi -> { };
+    }
+
+    /**
+     * Answers every request with {@code Connection: close}, so each call opens its own TCP
+     * connection. Fault proxies decide per connection, so this makes faults per request.
+     */
+    public void closeConnectionsAfterEachResponse(boolean close) {
+        closeConnections = close;
+    }
+
     /** Delays every confirm response, after the confirm has been applied (a lost response). */
-    void delayConfirmResponses(Duration delay) {
+    public void delayConfirmResponses(Duration delay) {
         confirmResponseDelay = delay;
     }
 
     /** Runs after a confirm is applied and before its response is sent (e.g. deliver a webhook). */
-    void afterConfirmApplied(Consumer<RailPaymentIntent> hook) {
+    public void afterConfirmApplied(Consumer<RailPaymentIntent> hook) {
         afterConfirmApplied = hook;
     }
 
-    List<Recorded> requestsTo(String pathSuffix) {
+    public List<Recorded> requestsTo(String pathSuffix) {
         return requests.stream().filter(r -> r.path().endsWith(pathSuffix)).toList();
     }
 
@@ -153,7 +173,7 @@ final class MockStripeServer implements AutoCloseable {
     // ------------------------------------------------------------------------------------------
     // Stripe-shaped JSON
 
-    static String stripeStatus(RailPiStatus status) {
+    public static String stripeStatus(RailPiStatus status) {
         return switch (status) {
             case REQUIRES_CONFIRMATION -> "requires_confirmation";
             case PROCESSING -> "processing";
@@ -181,7 +201,7 @@ final class MockStripeServer implements AutoCloseable {
     }
 
     /** Builds a Stripe event body carrying a payment intent. */
-    static byte[] eventJson(String eventId, String type, RailPaymentIntent pi) {
+    public static byte[] eventJson(String eventId, String type, RailPaymentIntent pi) {
         ObjectNode event = StripeJson.MAPPER.createObjectNode();
         event.put("id", eventId);
         event.put("object", "event");
@@ -204,8 +224,11 @@ final class MockStripeServer implements AutoCloseable {
         return body.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    private static void respond(HttpExchange exchange, int status, byte[] body) throws IOException {
+    private void respond(HttpExchange exchange, int status, byte[] body) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", "application/json");
+        if (closeConnections) {
+            exchange.getResponseHeaders().set("Connection", "close");
+        }
         exchange.sendResponseHeaders(status, body.length);
         exchange.getResponseBody().write(body);
     }

@@ -15,6 +15,7 @@ import dev.alaka.nidhi.IntentView;
 import dev.alaka.nidhi.MandateBalances;
 import dev.alaka.nidhi.NewMandate;
 import dev.alaka.testsupport.NidhiPostgres;
+import dev.alaka.testsupport.Sweeps;
 import dev.alaka.yaksha.ConfirmBehavior.RailFault;
 import dev.alaka.yaksha.WebhookRejectedException.Reason;
 import java.net.http.HttpClient;
@@ -339,21 +340,22 @@ class StripeWireIntegrationTest {
         f.engine.confirmOnRail(processing);
         f.assertBalances(4_500, 5_500, 0);
 
-        sweeper.sweepOnce();
+        Sweeps.until(sweeper, () -> taskStatus(reservedOnly).equals("COMPLETED")
+                && taskStatus(created).equals("COMPLETED") && taskStatus(charged).equals("COMPLETED"));
         assertThat(f.intent(reservedOnly).status()).isEqualTo(IntentStatus.VOIDED);
         assertThat(f.intent(created).status()).isEqualTo(IntentStatus.VOIDED);
         assertThat(f.stripe.state.retrieve(f.intent(created).railPaymentIntentId()).status())
                 .isEqualTo(RailPiStatus.CANCELED);
         assertThat(f.intent(charged).status()).isEqualTo(IntentStatus.CAPTURED);
-        assertThat(f.intent(processing).status()).isEqualTo(IntentStatus.CONFIRMING);
         for (UUID done : List.of(reservedOnly, created, charged)) {
-            assertThat(taskStatus(done)).isEqualTo("COMPLETED");
+            assertThat(attempts(done)).as("recovered by a single recovery attempt").isEqualTo(1);
         }
-        assertThat(taskStatus(processing)).isEqualTo("PENDING");
+        assertThat(f.intent(processing).status()).isEqualTo(IntentStatus.CONFIRMING);
         f.assertBalances(6_500, 1_500, 2_000);
 
-        sweeper.sweepOnce();
-        assertThat(taskStatus(processing)).isEqualTo("DEAD_LETTER");
+        // The PROCESSING intent is retried and, after maxAttempts = 2, dead-lettered with its hold kept.
+        Sweeps.until(sweeper, () -> taskStatus(processing).equals("DEAD_LETTER"));
+        assertThat(attempts(processing)).isEqualTo(2);
         assertThat(f.intent(processing).status()).isEqualTo(IntentStatus.CONFIRMING);
         f.assertBalances(6_500, 1_500, 2_000);
         assertThat(f.stripe.state.totalChargedMinor()).isEqualTo(2_000);
@@ -373,10 +375,13 @@ class StripeWireIntegrationTest {
         // A sweeper claimed the task and died: its lease has run out.
         update("UPDATE outbox_tasks SET status = 'PROCESSING', attempts = 1, locked_until = NOW() - INTERVAL '1 second'"
                 + " WHERE intent_id = ?", inFlight);
-        sweeper.sweepOnce();
+        Sweeps.until(sweeper, () -> taskStatus(inFlight).equals("COMPLETED"));
         assertThat(f.intent(inFlight).status()).isEqualTo(IntentStatus.VOIDED);
-        assertThat(taskStatus(inFlight)).isEqualTo("COMPLETED");
-        assertThat(count("SELECT attempts FROM outbox_tasks WHERE intent_id = ?", inFlight)).isEqualTo(2);
+        assertThat(attempts(inFlight)).isEqualTo(2);
+    }
+
+    private static long attempts(UUID intentId) throws SQLException {
+        return count("SELECT attempts FROM outbox_tasks WHERE intent_id = ?", intentId);
     }
 
     // ------------------------------------------------------------------------------------------

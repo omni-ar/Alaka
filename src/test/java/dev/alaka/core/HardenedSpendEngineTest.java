@@ -386,7 +386,8 @@ class HardenedSpendEngineTest {
         Fixture expiring = new Fixture(mode);
         UUID shortLived = expiring.engine.createMandate(new NewMandate(
                 expiring.agent, "USD", 1_000, 1_000, List.of(MERCHANT), Duration.ofMillis(1), "kid-test"));
-        Thread.sleep(20);
+        // Past expiry on every backend's clock, which can disagree by hundreds of milliseconds.
+        Thread.sleep(1_500);
         assertThatThrownBy(() -> expiring.engine.reserve(
                 new SpendRequest(shortLived, expiring.agent, "k-late", MERCHANT, "USD", 100)))
                 .isInstanceOf(NidhiException.MandateInactive.class);

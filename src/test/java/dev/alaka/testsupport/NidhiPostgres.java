@@ -36,9 +36,11 @@ public final class NidhiPostgres {
     private static NidhiPostgres shared;
 
     private final PostgreSQLContainer container;
+    private final String database;
 
-    private NidhiPostgres(PostgreSQLContainer container) {
+    private NidhiPostgres(PostgreSQLContainer container, String database) {
         this.container = container;
+        this.database = database;
     }
 
     /**
@@ -60,7 +62,28 @@ public final class NidhiPostgres {
      * @return a {@code jdbc:postgresql://} URL reachable from the test JVM
      */
     public String jdbcUrl() {
-        return container.getJdbcUrl();
+        return "jdbc:postgresql://" + container.getHost() + ":" + container.getMappedPort(5432) + "/" + database;
+    }
+
+    /**
+     * Creates (or recreates) a separate database in the same container with every migration
+     * applied exactly as for the shared one. For tests whose subject sweeps the whole database,
+     * such as the recovery sweeper, so that other test classes' leftover rows cannot interfere.
+     *
+     * @param name database name, lower-case letters, digits and underscores
+     * @return a handle on the fresh database
+     */
+    public synchronized NidhiPostgres isolatedDatabase(String name) {
+        if (!name.matches("[a-z][a-z0-9_]*") || name.equals(DATABASE)) {
+            throw new IllegalArgumentException("bad isolated database name " + name);
+        }
+        exec(container, "postgres", DATABASE, "-c", "DROP DATABASE IF EXISTS " + name + " WITH (FORCE)",
+                "-c", "CREATE DATABASE " + name);
+        Path migrations = Path.of("migrations").toAbsolutePath();
+        for (String file : migrationFileNames(migrations)) {
+            applyMigration(container, file.startsWith("000_") ? "postgres" : "alaka_migrator", name, file);
+        }
+        return new NidhiPostgres(container, name);
     }
 
     /**
@@ -104,9 +127,9 @@ public final class NidhiPostgres {
             throw new IllegalStateException("Expected migrations starting with 000_ in " + migrations);
         }
         for (String file : files) {
-            applyMigration(container, file.startsWith("000_") ? "postgres" : "alaka_migrator", file);
+            applyMigration(container, file.startsWith("000_") ? "postgres" : "alaka_migrator", DATABASE, file);
         }
-        return new NidhiPostgres(container);
+        return new NidhiPostgres(container, DATABASE);
     }
 
     private static List<String> migrationFileNames(Path migrations) {
@@ -120,22 +143,26 @@ public final class NidhiPostgres {
         }
     }
 
-    private static void applyMigration(PostgreSQLContainer container, String role, String file) {
+    private static void applyMigration(PostgreSQLContainer container, String role, String database, String file) {
+        exec(container, role, database, "--single-transaction", "-f", MIGRATIONS_IN_CONTAINER + "/" + file);
+    }
+
+    private static void exec(PostgreSQLContainer container, String role, String database, String... psqlArgs) {
+        List<String> command = new java.util.ArrayList<>(
+                List.of("psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", role, "-d", database));
+        command.addAll(List.of(psqlArgs));
         ExecResult result;
         try {
-            result = container.execInContainer(
-                    "psql", "-X", "-v", "ON_ERROR_STOP=1", "--single-transaction",
-                    "-U", role, "-d", DATABASE, "-f", MIGRATIONS_IN_CONTAINER + "/" + file);
+            result = container.execInContainer(command.toArray(String[]::new));
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot run psql for " + file, e);
+            throw new UncheckedIOException("Cannot run psql " + command, e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while applying " + file, e);
+            throw new IllegalStateException("Interrupted while running psql " + command, e);
         }
         if (result.getExitCode() != 0) {
             throw new IllegalStateException(
-                    "Migration " + file + " failed as " + role + " (exit " + result.getExitCode() + "): "
-                            + result.getStderr());
+                    "psql " + command + " failed as " + role + " (exit " + result.getExitCode() + "): " + result.getStderr());
         }
     }
 }
