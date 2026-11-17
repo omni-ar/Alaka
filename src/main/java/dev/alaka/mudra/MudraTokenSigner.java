@@ -1,9 +1,6 @@
 package dev.alaka.mudra;
 
-import java.security.GeneralSecurityException;
 import java.security.PrivateKey;
-import java.security.Signature;
-import java.util.Base64;
 import java.util.Objects;
 
 /**
@@ -16,7 +13,6 @@ import java.util.Objects;
 public final class MudraTokenSigner {
 
     static final String PREFIX = "mudra1";
-    private static final Base64.Encoder B64 = Base64.getUrlEncoder().withoutPadding();
 
     private final String kid;
     private final PrivateKey privateKey;
@@ -30,9 +26,7 @@ public final class MudraTokenSigner {
     public MudraTokenSigner(String kid, PrivateKey privateKey) {
         this.kid = Objects.requireNonNull(kid, "kid");
         this.privateKey = Objects.requireNonNull(privateKey, "privateKey");
-        if (!"Ed25519".equals(privateKey.getAlgorithm()) && !"EdDSA".equals(privateKey.getAlgorithm())) {
-            throw new IllegalArgumentException("not an Ed25519 key: " + privateKey.getAlgorithm());
-        }
+        MudraCodec.requireEd25519(privateKey);
     }
 
     /**
@@ -45,14 +39,6 @@ public final class MudraTokenSigner {
         if (!kid.equals(claims.tokenKid())) {
             throw new IllegalArgumentException("claims name key " + claims.tokenKid() + ", signer holds " + kid);
         }
-        byte[] payload = claims.canonicalBytes();
-        try {
-            Signature ed25519 = Signature.getInstance("Ed25519");
-            ed25519.initSign(privateKey);
-            ed25519.update(payload);
-            return PREFIX + "." + B64.encodeToString(payload) + "." + B64.encodeToString(ed25519.sign());
-        } catch (GeneralSecurityException e) {
-            throw new IllegalStateException("Ed25519 signing failed", e);
-        }
+        return MudraCodec.seal(PREFIX, claims.canonicalBytes(), privateKey);
     }
 }

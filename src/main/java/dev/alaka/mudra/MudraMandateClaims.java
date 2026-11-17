@@ -1,9 +1,6 @@
 package dev.alaka.mudra;
 
 import dev.alaka.nidhi.SignedMandateTerms;
-import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,7 +35,7 @@ public record MudraMandateClaims(
         long expiresAtEpochSec,
         String tokenKid) {
 
-    private static final byte[] DOMAIN = "alaka-mudra-mandate-v1".getBytes(StandardCharsets.UTF_8);
+    private static final String DOMAIN = "alaka-mudra-mandate-v1";
 
     public MudraMandateClaims {
         Objects.requireNonNull(mandateId, "mandateId");
@@ -66,28 +63,24 @@ public record MudraMandateClaims(
     }
 
     /**
-     * Returns the bytes that are signed: a domain tag followed by every field, each as a 4-byte
-     * big-endian length and its UTF-8 bytes. Length prefixes make the encoding unambiguous, so no
-     * two different claim sets share an encoding.
+     * Returns the bytes that are signed: the domain tag {@code alaka-mudra-mandate-v1} followed by
+     * every field, each as a 4-byte big-endian length and its UTF-8 bytes ({@link MudraCodec}).
+     * Length prefixes make the encoding unambiguous, so no two different claim sets share one.
      *
      * @return the canonical encoding
      */
     public byte[] canonicalBytes() {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        writeField(out, DOMAIN);
-        writeField(out, mandateId.toString());
-        writeField(out, agentId);
-        writeField(out, currency);
-        writeField(out, Long.toString(totalBudgetMinor));
-        writeField(out, Long.toString(maxPerTxMinor));
-        writeField(out, Integer.toString(allowedMerchants.size()));
+        MudraCodec.Writer out = new MudraCodec.Writer(DOMAIN)
+                .field(mandateId.toString())
+                .field(agentId)
+                .field(currency)
+                .field(totalBudgetMinor)
+                .field(maxPerTxMinor)
+                .field(allowedMerchants.size());
         for (String merchant : allowedMerchants) {
-            writeField(out, merchant);
+            out.field(merchant);
         }
-        writeField(out, Long.toString(notBeforeEpochSec));
-        writeField(out, Long.toString(expiresAtEpochSec));
-        writeField(out, tokenKid);
-        return out.toByteArray();
+        return out.field(notBeforeEpochSec).field(expiresAtEpochSec).field(tokenKid).bytes();
     }
 
     /**
@@ -98,35 +91,28 @@ public record MudraMandateClaims(
      * @throws IllegalArgumentException if the bytes are not a canonical encoding of valid claims
      */
     public static MudraMandateClaims fromCanonicalBytes(byte[] bytes) {
-        ByteBuffer in = ByteBuffer.wrap(bytes);
-        if (!java.util.Arrays.equals(readField(in), DOMAIN)) {
-            throw new IllegalArgumentException("not a Mudra mandate encoding");
-        }
-        UUID mandateId = UUID.fromString(readText(in));
-        String agentId = readText(in);
-        String currency = readText(in);
-        long total = Long.parseLong(readText(in));
-        long cap = Long.parseLong(readText(in));
-        int merchantCount = Integer.parseInt(readText(in));
+        MudraCodec.Reader in = new MudraCodec.Reader(bytes, DOMAIN);
+        UUID mandateId = UUID.fromString(in.text());
+        String agentId = in.text();
+        String currency = in.text();
+        long total = in.number();
+        long cap = in.number();
+        long merchantCount = in.number();
         if (merchantCount < 1 || merchantCount > 1_000) {
             throw new IllegalArgumentException("implausible merchant count " + merchantCount);
         }
-        List<String> merchants = new ArrayList<>(merchantCount);
+        List<String> merchants = new ArrayList<>((int) merchantCount);
         for (int i = 0; i < merchantCount; i++) {
-            merchants.add(readText(in));
+            merchants.add(in.text());
         }
-        long notBefore = Long.parseLong(readText(in));
-        long expiresAt = Long.parseLong(readText(in));
-        String kid = readText(in);
-        if (in.hasRemaining()) {
-            throw new IllegalArgumentException("trailing bytes after the last field");
-        }
+        long notBefore = in.number();
+        long expiresAt = in.number();
+        String kid = in.text();
+        in.end();
         MudraMandateClaims claims =
                 new MudraMandateClaims(mandateId, agentId, currency, total, cap, merchants, notBefore, expiresAt, kid);
         // Reject non-canonical encodings (e.g. an unsorted allowlist) so a token has exactly one form.
-        if (!java.util.Arrays.equals(claims.canonicalBytes(), bytes)) {
-            throw new IllegalArgumentException("encoding is not canonical");
-        }
+        MudraCodec.requireCanonical(claims.canonicalBytes(), bytes);
         return claims;
     }
 
@@ -140,35 +126,9 @@ public record MudraMandateClaims(
                 Instant.ofEpochSecond(notBeforeEpochSec), Instant.ofEpochSecond(expiresAtEpochSec), tokenKid);
     }
 
-    private static void requireText(String value, String name) {
+    static void requireText(String value, String name) {
         if (value == null || value.isEmpty()) {
             throw new IllegalArgumentException(name + " must not be empty");
         }
-    }
-
-    private static void writeField(ByteArrayOutputStream out, String value) {
-        writeField(out, value.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static void writeField(ByteArrayOutputStream out, byte[] value) {
-        out.writeBytes(ByteBuffer.allocate(4).putInt(value.length).array());
-        out.writeBytes(value);
-    }
-
-    private static byte[] readField(ByteBuffer in) {
-        if (in.remaining() < 4) {
-            throw new IllegalArgumentException("truncated encoding");
-        }
-        int length = in.getInt();
-        if (length < 0 || length > in.remaining()) {
-            throw new IllegalArgumentException("field length " + length + " out of range");
-        }
-        byte[] value = new byte[length];
-        in.get(value);
-        return value;
-    }
-
-    private static String readText(ByteBuffer in) {
-        return new String(readField(in), StandardCharsets.UTF_8);
     }
 }

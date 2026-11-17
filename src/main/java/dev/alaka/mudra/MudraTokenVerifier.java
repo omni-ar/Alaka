@@ -1,9 +1,6 @@
 package dev.alaka.mudra;
 
-import java.security.GeneralSecurityException;
 import java.security.PublicKey;
-import java.security.Signature;
-import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -18,8 +15,6 @@ import java.util.UUID;
  * currently in force.
  */
 public final class MudraTokenVerifier {
-
-    private static final Base64.Decoder B64 = Base64.getUrlDecoder();
 
     private final Map<String, PublicKey> trustedKeys;
 
@@ -43,17 +38,11 @@ public final class MudraTokenVerifier {
      */
     public MudraMandateClaims verify(String token) {
         Objects.requireNonNull(token, "token");
-        String[] parts = token.split("\\.", -1);
-        if (parts.length != 3 || !MudraTokenSigner.PREFIX.equals(parts[0])) {
-            throw new MudraException.MalformedToken("expected mudra1.<claims>.<signature>", null);
-        }
-        byte[] payload;
-        byte[] signature;
+        MudraCodec.Opened opened;
         MudraMandateClaims claims;
         try {
-            payload = B64.decode(parts[1]);
-            signature = B64.decode(parts[2]);
-            claims = MudraMandateClaims.fromCanonicalBytes(payload);
+            opened = MudraCodec.open(token, MudraTokenSigner.PREFIX);
+            claims = MudraMandateClaims.fromCanonicalBytes(opened.payload());
         } catch (IllegalArgumentException e) {
             throw new MudraException.MalformedToken("undecodable token: " + e.getMessage(), e);
         }
@@ -61,16 +50,7 @@ public final class MudraTokenVerifier {
         if (key == null) {
             throw new MudraException.UnknownKey("untrusted signing key " + claims.tokenKid());
         }
-        boolean valid;
-        try {
-            Signature ed25519 = Signature.getInstance("Ed25519");
-            ed25519.initVerify(key);
-            ed25519.update(payload);
-            valid = ed25519.verify(signature);
-        } catch (GeneralSecurityException e) {
-            valid = false;
-        }
-        if (!valid) {
+        if (!MudraCodec.verify(key, opened)) {
             throw new MudraException.BadSignature("signature does not verify for key " + claims.tokenKid());
         }
         return claims;

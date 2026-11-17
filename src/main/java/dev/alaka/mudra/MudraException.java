@@ -48,6 +48,38 @@ public abstract sealed class MudraException extends RuntimeException {
         }
     }
 
+    /**
+     * The signed quote is missing, malformed, signed by an untrusted key, tampered with, or issued
+     * for a different request (mandate, agent or idempotency key).
+     */
+    public static final class InvalidQuote extends MudraException {
+        private static final long serialVersionUID = 1L;
+
+        /** Why the quote was rejected. */
+        public enum Reason {
+            MALFORMED,
+            UNKNOWN_KEY,
+            BAD_SIGNATURE,
+            MISMATCH
+        }
+
+        private final Reason reason;
+
+        public InvalidQuote(Reason reason, String message) {
+            super(message, null);
+            this.reason = reason;
+        }
+
+        /**
+         * Returns why the quote was rejected.
+         *
+         * @return the reason
+         */
+        public Reason reason() {
+            return reason;
+        }
+    }
+
     /** The spend request drifted from the approved quote. */
     public static final class QuoteDrift extends MudraException {
         private static final long serialVersionUID = 1L;

@@ -7,6 +7,7 @@ import dev.alaka.core.RuntimeMode;
 import dev.alaka.core.SpendEngine;
 import dev.alaka.core.SpendEngines;
 import dev.alaka.core.SpendGateway;
+import dev.alaka.mudra.MudraQuoteVerifier;
 import dev.alaka.mudra.MudraTokenVerifier;
 import dev.alaka.mudra.QuoteDriftEvaluator;
 import dev.alaka.yaksha.PaymentRailPort;
@@ -72,18 +73,34 @@ public class AlakaConfiguration {
 
     @Bean
     MudraTokenVerifier mudraTokenVerifier(AlakaProperties properties) throws GeneralSecurityException {
-        Map<String, PublicKey> keys = new HashMap<>();
-        KeyFactory ed25519 = KeyFactory.getInstance("Ed25519");
-        for (Map.Entry<String, String> entry : properties.mudra().trustedKeys().entrySet()) {
-            keys.put(entry.getKey(),
-                    ed25519.generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(entry.getValue()))));
-        }
-        return new MudraTokenVerifier(keys);
+        return new MudraTokenVerifier(decodeKeys(properties.mudra().trustedKeys(), "alaka.mudra.trusted-keys"));
     }
 
     @Bean
-    SpendGateway spendGateway(MudraTokenVerifier mudraTokenVerifier, SpendEngine spendEngine) {
-        return new SpendGateway(mudraTokenVerifier, new QuoteDriftEvaluator(Clock.systemUTC()), spendEngine);
+    MudraQuoteVerifier mudraQuoteVerifier(AlakaProperties properties) throws GeneralSecurityException {
+        return new MudraQuoteVerifier(
+                decodeKeys(properties.mudra().trustedQuoteKeys(), "alaka.mudra.trusted-quote-keys"));
+    }
+
+    @Bean
+    SpendGateway spendGateway(
+            MudraTokenVerifier mudraTokenVerifier, MudraQuoteVerifier mudraQuoteVerifier, SpendEngine spendEngine) {
+        return new SpendGateway(mudraTokenVerifier, mudraQuoteVerifier, new QuoteDriftEvaluator(Clock.systemUTC()),
+                spendEngine);
+    }
+
+    private static Map<String, PublicKey> decodeKeys(Map<String, String> encoded, String property)
+            throws GeneralSecurityException {
+        if (encoded == null || encoded.isEmpty()) {
+            throw new IllegalStateException(property + " must name at least one Ed25519 public key");
+        }
+        Map<String, PublicKey> keys = new HashMap<>();
+        KeyFactory ed25519 = KeyFactory.getInstance("Ed25519");
+        for (Map.Entry<String, String> entry : encoded.entrySet()) {
+            keys.put(entry.getKey(),
+                    ed25519.generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(entry.getValue()))));
+        }
+        return keys;
     }
 
     @Bean

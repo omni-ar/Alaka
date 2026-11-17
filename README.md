@@ -42,6 +42,12 @@ every drifted amount below the cap.
 What has to be checked is the relationship between the settlement and the approved quote: same
 merchant, same currency, amount within an explicit slippage tolerance, and an unexpired quote.
 
+That check is only as trustworthy as the quote itself. If the agent supplies the "approved" quote,
+a compromised agent can simply raise it. So in Alaka the quote is an Ed25519 token signed by the
+approving party, under a trust set separate from the mandate issuer's. It is also bound to one
+`(mandate_id, agent_id, idempotency_key)`, so an approval can neither be edited nor reused for a
+second purchase (§8.1).
+
 ### 1b. Read-then-charge races (TOCTOU)
 
 The obvious implementation has three steps:
@@ -56,7 +62,7 @@ storms make it routine.
 
 This repository implements that design as `--mode=naive` (`NaiveSpendEngine`, unguarded table
 `naive_spend_log`) to measure it. Fifty concurrent requests against a 10,000 budget charged the rail
-**34,996–39,995** across seven runs (§6.3).
+**34,996–49,995** across twelve runs (§6.3).
 
 ### 1c. Lost responses and an unindexed remote side effect
 
@@ -77,7 +83,7 @@ the card was charged. The ways it could find out each fail, per Stripe's API ref
 
 A recovery job that voids the local reservation because "the charge does not seem to exist" can
 therefore release budget while a delayed confirm is still in flight. The confirm then succeeds, and
-the freed budget is spent a second time. This exact interleaving is the TLC counterexample in §5.
+the freed budget is spent a second time. This exact interleaving is the TLC counterexample in §4.2.
 
 ---
 
@@ -90,7 +96,7 @@ boundary.
 
 | Package | Name | Trusts | Responsibility |
 |---------|------|--------|----------------|
-| `dev.alaka.mudra` | *Mudrā*, the seal | Only trusted Ed25519 public keys | Verifies capability tokens; rejects quote drift. Runs entirely in memory, before any database access |
+| `dev.alaka.mudra` | *Mudrā*, the seal | Only trusted Ed25519 public keys, in two separate sets: mandate issuers and quote approvers | Verifies capability tokens (`mudra1`) and signed quotes (`mudraq1`); rejects quote drift. Runs entirely in memory, before any database access |
 | `dev.alaka.nidhi` | *Nidhi*, the treasury | Nothing; it enforces | PostgreSQL 16 double-entry ledger. Every invariant that can be stated over rows is enforced by the database itself, against the runtime role `alaka_app` |
 | `dev.alaka.yaksha` | *Yakṣa*, the guardians | Stripe's `GET` and webhooks with valid HMAC signatures | Two-step rail adapter, webhook verification and deduplication, crash recovery sweeper |
 | `dev.alaka.core` | | Its collaborators | Orders the phases, gates idempotency, selects the concurrency mode, serves HTTP |
@@ -107,7 +113,8 @@ flowchart TB
     end
 
     subgraph MUDRA["dev.alaka.mudra (in memory)"]
-        ver["MudraTokenVerifier<br/>Ed25519"]
+        ver["MudraTokenVerifier<br/>mandate token, issuer keys"]
+        qver["MudraQuoteVerifier<br/>signed quote, approver keys"]
         drift["QuoteDriftEvaluator"]
     end
 
@@ -124,11 +131,12 @@ flowchart TB
 
     stripe["Stripe v1 API"]
 
-    agent -->|"X-Mudra-Token + spend + quote"| http
+    agent -->|"X-Mudra-Token + spend + quote_token"| http
     http --> gw
-    gw -->|"1. verify token"| ver
-    gw -->|"2. check quote drift"| drift
-    gw -->|"3. execute"| eng
+    gw -->|"1. verify mandate token"| ver
+    gw -->|"2. verify quote for this key"| qver
+    gw -->|"3. check quote drift"| drift
+    gw -->|"4. execute"| eng
     eng -->|"short transactions only"| tx
     tx --> db
     eng -->|"between transactions"| guard
@@ -151,7 +159,7 @@ Zero locks are held across HTTP calls, and this is enforced, not just documented
 
 | Step | Where | What |
 |------|-------|------|
-| Phase 1 | One DB transaction | Idempotency gate (§4.3). Lock the mandate `FOR SHARE`; in the pessimistic mode also lock `mandate_balances FOR UPDATE`. Insert the intent as `RESERVED`, a `RESERVE` ledger transaction (`DEBIT MANDATE_AVAILABLE`, `CREDIT MANDATE_HELD`) and a recovery task in `outbox_tasks`, then `COMMIT` |
+| Phase 1 | One DB transaction | Idempotency gate (§3, I2). Lock the mandate `FOR SHARE`; in the pessimistic mode also lock `mandate_balances FOR UPDATE`. Insert the intent as `RESERVED`, a `RESERVE` ledger transaction (`DEBIT MANDATE_AVAILABLE`, `CREDIT MANDATE_HELD`) and a recovery task in `outbox_tasks`, then `COMMIT` |
 | Step 2A | HTTP | `POST /v1/payment_intents` with `confirm=false` and `Idempotency-Key: create_<intent_id>`. An unconfirmed payment intent cannot move money, so a delayed or duplicated create is harmless |
 | | One short DB transaction | Record `pi_...` (write-once) and move `RESERVED` to `CONFIRMING` |
 | Step 2B | HTTP | `POST /v1/payment_intents/{pi}/confirm` with `Idempotency-Key: confirm_<intent_id>`. This is the only call that can move money, and it is sent only after `CONFIRMING` with the `pi_...` has been committed |
@@ -189,7 +197,7 @@ sequenceDiagram
 ### 2.3 Intent lifecycle and bucket movements
 
 Every arrow that moves money is one database transaction, in which the intent row, the ledger
-transaction and its balanced postings commit together (enforced: `[NIDHI-D9]`, §6.2). The schema's
+transaction and its balanced postings commit together (enforced: `[NIDHI-D9]`, §5.5). The schema's
 `intent_status` also defines `AUTHORIZED` and `FAILED`, which the engine does not use.
 
 ```mermaid
@@ -257,7 +265,9 @@ The rail is modelled with these behaviours:
 - **Delayed resolution.** `PROCESSING` resolves later, nondeterministically, to `SUCCEEDED` or
   `CANCELED`.
 - **Partial capture.** A charge may be lower than the authorized amount, and the remainder returns
-  to `MANDATE_AVAILABLE`.
+  to `MANDATE_AVAILABLE`. The ledger kernel enforces this too. The Stripe adapter, however, uses
+  `capture_method=automatic`, under which a card payment is always captured in full, so partial
+  capture is verified in the model and the ledger but not reachable through Stripe yet (§9).
 
 The recovery actions are enabled at every interleaving, so "the worker never saw the response" is
 covered without modelling worker processes explicitly.
@@ -498,28 +508,65 @@ dangerous shapes outright:
 
 `--mode=naive` overspends only because it keeps its books outside the kernel, in `naive_spend_log`.
 
-### 6.3 Fifty virtual threads, retry storm (`ConcurrencyStormTest`)
+### 6.3 Fifty virtual threads: one hot mandate vs ten (`ConcurrencyStormTest`)
 
-**Workload.** One mandate with a budget of 10,000 and a per-transaction cap of 2,000:
+**Single-mandate workload.** One mandate with a budget of 10,000 and a per-transaction cap of 2,000:
 
 - 40 distinct spends of 1,000 each, so demand is four times the budget;
 - 10 retries re-sending keys already in use, 5 of them with a tampered amount;
 - all 50 threads released by one latch;
 - simulated rail latency of 5–15 ms per call, so check-then-act windows overlap.
 
-The ranges are across seven full runs.
+Counts are ranges across twelve full runs. Latencies are from one run with migration `003`
+applied; the same run is quoted in `docs/DESIGN.md`.
 
-| Mode | Rail charged / budget | Invariant violations | `40001` | p50 / p95 / p99 |
-|------|----------------------|---------------------|--------:|-----------------|
-| `naive` | **34,996 – 39,995** / 10,000 | 14–18 per run (I1 ×3, I2 ×10–14, I3 ×1) | 0 | ≈ 190 / 220 / 230 ms |
-| `hardened-pessimistic` | **10,000** / 10,000 | 0 | 0 | ≈ 1.5 / 2.6 / 2.8 s |
-| `hardened-ssi` | **9,999 – 10,000** / 10,000 | 0 | **637 – 790** (never exhausted) | ≈ 1.7 / 2.4 / 2.5 s |
+| Mode | Rail charged / budget | Invariant violations | `40001` | p50 / p95 / p99 (ms) |
+|------|----------------------|---------------------|--------:|---------------------:|
+| `naive` | **34,996 – 49,995** / 10,000 | 14–24 per run (I1 ×3, I2 ×10–20, I3 ×1) | 0 | 171 / 193 / 197 |
+| `hardened-pessimistic` | **10,000** / 10,000 | 0 | 0 | 1,816 / 3,067 / 3,196 |
+| `hardened-ssi` | **9,997 – 10,000** / 10,000 | 0 | **637 – 865** (never exhausted) | 1,890 / 2,438 / 2,462 |
 
-**Why 9,999.** In those runs, a tampered 999 request won the race for its key. It became the stored
-request, the original 1,000 was rejected with 422, and the ledger and the rail agree on 9,999.
+**Why 9,997–9,999.** In those runs, tampered 999 requests won the race for their keys. They became
+the stored requests, the original 1,000s were rejected with 422, and the ledger and the rail agree.
+The worst `naive` run (49,995) charged every duplicate retry as well.
 
-**What the latencies are.** They come from fifty writers queuing on one balance row from a laptop,
-through Docker Desktop's network. They show relative behaviour, not throughput (§9).
+**Multi-mandate workload.** Ten mandates, each with a budget of 10,000 and a cap of 3,000:
+
+- each mandate gets five threads spending 3,000, so three fit and two must fail with `SG003`;
+- the same 50 threads are released by one latch, through one shared connection pool;
+- each mandate has its own engine and simulated rail, all checked by `InvariantChecker`;
+- deadlocks are asserted to be zero from `EngineMetrics`, because the pessimistic mode would
+  otherwise retry them silently.
+
+Every run below charged exactly 90,000 of the 100,000 total, with 0 invariant violations and
+0 `40P01`.
+
+| Mode, schema | `40001` | p50 / p95 / p99 (ms) | `ledger_postings` seq / index scans |
+|--------------|--------:|---------------------:|------------------------------------:|
+| pessimistic, 001–002 (run 1, run 2) | 0, 0 | 329 / 422 / 437; 313 / 382 / 386 | 79 / 78; 70 / 65 |
+| pessimistic, with 003 | 0, 0, 0 | 341 / 455 / 492; 288 / 360 / 390; 301 / 382 / 408 | 11 / 117; 11 / 110; 11 / 154 |
+| SSI, 001–002 | **1,121, 1,093** | 2,286 / 2,874 / 2,967; 1,991 / 2,646 / 2,716 | 613 / 664; 677 / 721 |
+| SSI, with 003 | **521, 586, 438** | 1,014 / 1,242 / 1,295; 1,149 / 1,475 / 1,517; 1,007 / 1,228 / 1,269 | 10 / 536; 10 / 566; 10 / 524 |
+
+The scan counters are deltas of `pg_stat_user_tables` over the storm and its invariant check; the
+check itself accounts for about 10 scans.
+
+**What the comparison shows.**
+
+- **Pessimistic scales with independent mandates.** Each mandate's balance row is its own lock, so
+  p50 drops from about 1.8 s on one hot mandate to about 0.3 s across ten, with no retries and no
+  deadlocks.
+- **SSI did not scale before `003`.** Ten mandates that share no rows produced *more* serialization
+  failures (1,093–1,121) than fifty threads on one mandate. The cause was a full-table scan,
+  explained in §7.4.
+- **The index halves SSI's cross-mandate retries and latency** (438–586 retries, p50 1.0–1.1 s),
+  but does not remove them. The predicate locks now cover index pages, and at test scale the ten
+  mandates' postings share a few index pages.
+
+**What the latencies are.** They come from a laptop, through Docker Desktop's network, and show
+relative behaviour, not throughput (§9). Single-mandate pessimistic p50 varied between about 1.5 s
+and 2.0 s across the project's runs, with and without `003`. Its latency is dominated by fifty
+writers queuing on one balance row, which no index changes.
 
 The jqwik stateful suite (`SpendLifecycleProperties`) complements the storm with sequential depth.
 It generates two properties, 30 tries each, of up to 30 random actions per try:
@@ -605,6 +652,36 @@ afterwards showed none.
 numbered ids per instance, starting at `pi_sim_1`, so two test rails sharing one database collided
 with `23505`. Simulated ids are now unique per rail instance, as Stripe's are globally.
 
+### 7.4 Finding: an unindexed check made unrelated mandates conflict under SSI
+
+At `COMMIT` of every money-moving transaction, `trg_verify_tx_and_mandate_integrity` cross-checks
+the materialised balance against the raw postings:
+
+```sql
+SELECT ... FROM ledger_postings p JOIN ledger_accounts a ON a.account_id = p.account_id
+ WHERE p.mandate_id = NEW.mandate_id
+```
+
+Migration `001` has no index leading on `ledger_postings.mandate_id` (its indexes lead on
+`posting_id` and `tx_id`), so this is a sequential scan of the whole table.
+
+**Why that matters under `SERIALIZABLE`.** PostgreSQL's serializable snapshot isolation records
+what each transaction read as SIREAD predicate locks, and a sequential scan records a lock on the
+entire relation. Every transaction that wrote any posting therefore appeared to have read
+everything the others wrote. Reservations on ten unrelated mandates conflicted as if they were one,
+and the multi-mandate storm measured 1,093–1,121 `40001`, against 853–865 for fifty threads on a
+single mandate.
+
+**The fix.** `migrations/003_index_postings_mandate.sql` adds
+`CREATE INDEX ledger_postings_mandate_idx ON ledger_postings (mandate_id)`. The scan counters
+confirm the plan change: sequential scans of `ledger_postings` during the SSI storm fell from 613–677
+to about 10 (the invariant check's own reads). Cross-mandate `40001` fell to 438–586, and p50 from
+about 2.0–2.3 s to 1.0–1.1 s.
+
+**What remains.** Page-granular predicate locks on a still-small index keep some false conflicts.
+The pessimistic mode never had this problem: it serialises on row locks, which the scan does not
+take.
+
 ---
 
 ## 8. Running it
@@ -617,7 +694,7 @@ bash scripts/verify-all.sh                    # tla, sql, concurrency, java; exi
 bash scripts/verify-all.sh --wide             # also the 940,994-state TLC configuration
 bash scripts/verify-all.sh tla                # one gate; others: sql, concurrency, java
 bash scripts/verify-all.sh sql concurrency    # several gates
-./mvnw -B clean verify                        # Java only: 112 tests, 1 skipped without STRIPE_TEST_KEY
+./mvnw -B clean verify                        # Java only: 120 tests, 1 skipped without STRIPE_TEST_KEY
 make verify-all                               # same targets, where make is installed
 ```
 
@@ -639,7 +716,7 @@ Details:
 ```bash
 docker compose up -d --wait
 docker exec -i alaka-postgres psql -U postgres -d alaka --single-transaction < migrations/000_roles.sql
-for f in migrations/001_*.sql migrations/002_*.sql; do
+for f in migrations/001_*.sql migrations/002_*.sql migrations/003_*.sql; do
   docker exec -i alaka-postgres psql -U alaka_migrator -d alaka --single-transaction < "$f"
 done
 ```
@@ -653,8 +730,12 @@ java -jar target/alaka-0.1.0-SNAPSHOT.jar \
   --alaka.db.url=jdbc:postgresql://localhost:54329/alaka --alaka.db.password=alaka_app_dev_only \
   --alaka.stripe.secret-key=sk_test_... --alaka.stripe.webhook-secret=whsec_... \
   --alaka.stripe.confirm-payment-method=pm_card_visa \
-  --alaka.mudra.trusted-keys.kid-1=<base64 X.509 Ed25519 public key>
+  --alaka.mudra.trusted-keys.kid-1=<base64 X.509 Ed25519 public key of the mandate issuer> \
+  --alaka.mudra.trusted-quote-keys.q-1=<base64 X.509 Ed25519 public key of the quote approver>
 ```
+
+The two trust sets are deliberately separate. A mandate issuer's key cannot sign purchase
+approvals, and the service refuses to start if either set is empty.
 
 **3. Call it.** Request bodies are snake_case JSON.
 
@@ -663,13 +744,13 @@ java -jar target/alaka-0.1.0-SNAPSHOT.jar \
 curl -X POST localhost:8080/v1/mandates -H 'Content-Type: application/json' \
      -d '{"token":"mudra1.<claims>.<signature>"}'
 
-# Spend under that mandate and an approved quote         -> 200 terminal, 202 still settling
+# Spend under that mandate and a signed approval of exactly this request
+#                                                        -> 200 terminal, 202 still settling
 curl -X POST localhost:8080/v1/spends -H 'Content-Type: application/json' \
      -H 'X-Mudra-Token: mudra1.<claims>.<signature>' -d '{
        "mandate_id":"<uuid>", "agent_id":"agent-1", "idempotency_key":"order-42",
        "merchant_id":"merchant-a", "currency":"USD", "amount_minor":2020,
-       "quote":{"merchant_id":"merchant-a","currency":"USD","quoted_amount_minor":2000,
-                "max_slippage_bps":100,"expires_at":"2026-12-01T00:00:00Z"}}'
+       "quote_token":"mudraq1.<claims>.<signature>"}'
 
 # Revoke, irreversibly                                  -> 200; 409 if already terminal
 curl -X POST localhost:8080/v1/mandates/<uuid>/revoke -H 'Content-Type: application/json' -d '{"reason":"rotated"}'
@@ -686,10 +767,10 @@ POST /v1/webhooks/stripe
 | 200 | The intent reached a terminal state |
 | 202 | Still settling: the rail is `processing`, or recovery could not reach the rail |
 | 409 + `Retry-After: 1` | The same key is in flight |
-| 422 | The key was reused with a different payload; or an invalid, mismatched or untrusted token; or quote drift; or `SG002` |
+| 422 | The key was reused with a different payload; an invalid, mismatched or untrusted mandate token; a missing, malformed, untrusted, tampered or mismatched `quote_token` (`InvalidQuote.<reason>`); quote drift (`QuoteDrift.<reason>`); or `SG002` |
 | 402 | `SG003` |
 | 403 | `SG001` or `SG008` |
-| 400 | `X-Mudra-Token` is missing |
+| 400 | `X-Mudra-Token` is missing, or the body is not the documented shape (an unsigned `quote` object is refused) |
 
 `AlakaHttpControllerTest` starts the application and checks each of these over HTTP.
 
@@ -703,18 +784,47 @@ POST /v1/webhooks/stripe
 - **Validity window:** the verifier does not judge it against the application clock. PostgreSQL
   does that with `NOW()` on every reservation (I4).
 
+**Quote tokens.** A quote token is `mudraq1.<base64url claims>.<base64url Ed25519 signature>`,
+signed by the approving party (the user, or an approval service), never by the agent.
+
+- **Claim fields:** `mandate_id`, `agent_id`, `idempotency_key`, `merchant_id`, `currency`,
+  `quoted_amount_minor`, `max_slippage_bps`, `expires_at` and `quote_kid`.
+- **Encoding:** the same length-prefixed scheme as mandate tokens, under the domain tag
+  `alaka-mudra-quote-v1` (shared code: `MudraCodec`). A mandate token relabelled as a quote does not
+  verify.
+- **Checks, in order, before any database access:**
+  1. the signature verifies under a key in `alaka.mudra.trusted-quote-keys`;
+  2. the quote names this request's mandate, agent and idempotency key;
+  3. the drift check (§1a) passes against the signed values.
+- **One approval, one purchase.** `UNIQUE (agent_id, idempotency_key)` allows one intent per key,
+  and the quote is bound to the key. So an approval can authorise at most one intent; presenting it
+  with another key fails with `InvalidQuote.MISMATCH`. No schema change was needed for this.
+
 ---
 
 ## 9. Boundaries and non-goals
 
-- **The approved quote is not attested.** `POST /v1/spends` accepts the quote in the agent's own
-  request body. The drift check stops a price or merchant that changed between approval and
-  settlement, but it does not stop a compromised agent that fabricates its quote. The approving user
-  or merchant must sign the quote, as the mandate is signed, before it can serve as a defence
-  against the agent itself.
+- **Quotes are only as trustworthy as the approver's key.** A compromised agent can no longer
+  fabricate, edit or reuse an approval (§8.1). Everything still depends on the approving party:
+  whoever holds a key in `alaka.mudra.trusted-quote-keys` can approve any purchase within the
+  mandate. Key storage, rotation and revocation of quote keys are not implemented.
+- **Quote expiry uses the application clock**, because it is checked before Phase 1. A retry of a
+  completed request after its quote has expired gets `422 QuoteDrift.QUOTE_EXPIRED` instead of the
+  stored result, so clients should replay within the approval window.
+- **Partial capture is verified but not reachable on Stripe.** `AlakaInFlight.tla` and the ledger
+  kernel support `captured_amount_minor < authorized_amount_minor`, with the remainder returning to
+  `MANDATE_AVAILABLE`, and the property suite exercises it through `SimulatedPaymentRail`.
+  `StripeHttpPaymentRail` sends `capture_method=automatic`, under which Stripe captures a card
+  payment in full. Partial capture on Stripe would need three things, none implemented:
+  `capture_method=manual` and a `/capture` call; an `AUTHORIZED` state in the protocol and the TLA+
+  model (otherwise recovery would cancel an authorisation meant to be captured); and a persisted
+  capture amount for recovering a lost `/capture` response.
+- **SSI still has false conflicts across mandates.** Even with the `003` index, the multi-mandate
+  storm sees 438–586 `40001` (§6.3, §7.4), because predicate locks are page-granular. The
+  pessimistic mode has none.
 - **Loss is bounded, not eliminated.**
-  - A compromised agent holding a valid token can spend up to `total_budget_minor` at allowlisted
-    merchants. I1 makes that the worst case.
+  - A compromised agent holding a valid mandate token, and approvals from a trusted approver, can
+    spend up to `total_budget_minor` at allowlisted merchants. I1 makes that the worst case.
   - A dead-lettered `processing` intent keeps its hold, so budget is locked, not lost, until someone
     resolves it.
   - Orphaned unconfirmed payment intents can accumulate on Stripe. They cannot charge, but nothing
@@ -754,10 +864,12 @@ spec/probes/                         14 reachability probes
 migrations/000_roles.sql             alaka_migrator / alaka_app, database-level revokes
 migrations/001_init_nidhi_ledger.sql ledger kernel, deferred triggers, [NIDHI-D1..D10]
 migrations/002_naive_baseline.sql    deliberately unguarded table for --mode=naive
+migrations/003_index_postings_mandate.sql  index behind the per-commit integrity check (§7.4)
 tests/sql/                           attack suite (137), owner guards (20), concurrency probe
 src/main/java/dev/alaka/core/        engines, gateway, RailCallGuard, http/
 src/main/java/dev/alaka/nidhi/       NidhiLedger, TransactionRunner, SqlStates, NidhiException
-src/main/java/dev/alaka/mudra/       MudraTokenSigner/Verifier, MudraMandateClaims, QuoteDriftEvaluator
+src/main/java/dev/alaka/mudra/       MudraTokenSigner/Verifier, MudraMandateClaims, MudraQuoteSigner/Verifier,
+                                     MudraQuoteClaims, MudraCodec, QuoteDriftEvaluator
 src/main/java/dev/alaka/yaksha/      PaymentRailPort, StripeHttpPaymentRail, StripeWebhookVerifier,
                                      StripeWebhookHandler, YakshaRecoverySweeper, SimulatedPaymentRail
 src/test/java/dev/alaka/property/    jqwik stateful suite, InvariantChecker

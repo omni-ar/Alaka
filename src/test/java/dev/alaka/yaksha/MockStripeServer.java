@@ -145,6 +145,11 @@ public final class MockStripeServer implements AutoCloseable {
             respond(exchange, 400, error("invalid_request_error", "parameter_invalid", "confirm must be false here", null));
             return;
         }
+        if (!"automatic".equals(form.get("capture_method"))) {
+            respond(exchange, 400, error("invalid_request_error", "parameter_invalid",
+                    "this mock implements capture_method=automatic only", null));
+            return;
+        }
         String key = headers.get("idempotency-key");
         if (key == null) {
             respond(exchange, 400, error("invalid_request_error", "parameter_missing", "Idempotency-Key required by this mock", null));
@@ -183,7 +188,14 @@ public final class MockStripeServer implements AutoCloseable {
     }
 
     static ObjectNode piNode(RailPaymentIntent pi) {
+        if (pi.status() == RailPiStatus.SUCCEEDED && pi.chargedMinor() != pi.amountMinor()) {
+            // Automatic capture (the only mode the adapter uses) charges a card payment in full;
+            // a partial amount_received would be a behaviour real Stripe does not have.
+            throw new IllegalStateException("mock misconfigured: automatic capture of " + pi.piId() + " charged "
+                    + pi.chargedMinor() + " of " + pi.amountMinor());
+        }
         ObjectNode node = StripeJson.MAPPER.createObjectNode();
+        node.put("capture_method", "automatic");
         node.put("id", pi.piId());
         node.put("object", "payment_intent");
         node.put("amount", pi.amountMinor());

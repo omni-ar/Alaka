@@ -47,9 +47,13 @@ public record AlakaProperties(
     }
 
     /**
-     * @param trustedKeys Ed25519 public keys by key id, each base64 of its X.509 SubjectPublicKeyInfo
+     * Two separate trust sets, each mapping a key id to the base64 of an Ed25519 X.509
+     * SubjectPublicKeyInfo.
+     *
+     * @param trustedKeys mandate issuer keys (verify {@code mudra1} capability tokens)
+     * @param trustedQuoteKeys approving-party keys (verify {@code mudraq1} quote tokens)
      */
-    public record Mudra(Map<String, String> trustedKeys) {
+    public record Mudra(Map<String, String> trustedKeys, Map<String, String> trustedQuoteKeys) {
     }
 
     /**

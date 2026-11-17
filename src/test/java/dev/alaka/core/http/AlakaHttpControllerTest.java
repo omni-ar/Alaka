@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.alaka.core.AlakaApplication;
 import dev.alaka.mudra.MudraMandateClaims;
+import dev.alaka.mudra.MudraQuoteClaims;
+import dev.alaka.mudra.MudraQuoteSigner;
 import dev.alaka.mudra.MudraTokenSigner;
 import dev.alaka.testsupport.NidhiPostgres;
 import dev.alaka.yaksha.ConfirmBehavior;
@@ -20,6 +22,9 @@ import java.net.http.HttpResponse;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Base64;
@@ -49,13 +54,18 @@ class AlakaHttpControllerTest {
     private static ConfigurableApplicationContext app;
     private static URI base;
     private static MudraTokenSigner signer;
+    private static MudraQuoteSigner approver;
+    private static KeyPair issuer;
+    private static NidhiPostgres db;
 
     @BeforeAll
     static void startApplication() throws NoSuchAlgorithmException {
-        KeyPair issuer = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+        issuer = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+        KeyPair approverKeys = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
         signer = new MudraTokenSigner("kid-http", issuer.getPrivate());
+        approver = new MudraQuoteSigner("quote-http", approverKeys.getPrivate());
         stripe = new MockStripeServer(API_KEY);
-        NidhiPostgres db = NidhiPostgres.shared().isolatedDatabase("alaka_http");
+        db = NidhiPostgres.shared().isolatedDatabase("alaka_http");
         app = new SpringApplicationBuilder(AlakaApplication.class).run(
                 "--server.port=0",
                 "--alaka.mode=hardened-pessimistic",
@@ -68,6 +78,8 @@ class AlakaHttpControllerTest {
                 "--alaka.stripe.confirm-payment-method=pm_card_visa",
                 "--alaka.stripe.request-timeout=5s",
                 "--alaka.mudra.trusted-keys.kid-http=" + Base64.getEncoder().encodeToString(issuer.getPublic().getEncoded()),
+                "--alaka.mudra.trusted-quote-keys.quote-http="
+                        + Base64.getEncoder().encodeToString(approverKeys.getPublic().getEncoded()),
                 "--alaka.recovery.sweep-interval=0s");
         base = URI.create("http://127.0.0.1:" + app.getEnvironment().getProperty("local.server.port"));
     }
@@ -93,21 +105,31 @@ class AlakaHttpControllerTest {
         return new Reply(response.statusCode(), body, response);
     }
 
+    /** A spend with a quote the approver signed for exactly this request, at {@code quoted} + 1 %. */
     private static String spendJson(UUID mandate, String agent, String key, String merchant, long amount, long quoted) {
-        return JSON.createObjectNode()
+        return spendJson(mandate, agent, key, merchant, amount, approver.sign(quoteClaims(mandate, agent, key, merchant,
+                quoted, 100, "quote-http")));
+    }
+
+    private static MudraQuoteClaims quoteClaims(UUID mandate, String agent, String key, String merchant, long quoted,
+            int bps, String kid) {
+        return new MudraQuoteClaims(mandate, agent, key, merchant, "USD", quoted, bps,
+                Instant.now().getEpochSecond() + 300, kid);
+    }
+
+    private static String spendJson(UUID mandate, String agent, String key, String merchant, long amount,
+            String quoteToken) {
+        com.fasterxml.jackson.databind.node.ObjectNode body = JSON.createObjectNode()
                 .put("mandate_id", mandate.toString())
                 .put("agent_id", agent)
                 .put("idempotency_key", key)
                 .put("merchant_id", merchant)
                 .put("currency", "USD")
-                .put("amount_minor", amount)
-                .<com.fasterxml.jackson.databind.node.ObjectNode>set("quote", JSON.createObjectNode()
-                        .put("merchant_id", merchant)
-                        .put("currency", "USD")
-                        .put("quoted_amount_minor", quoted)
-                        .put("max_slippage_bps", 100)
-                        .put("expires_at", Instant.now().plusSeconds(300).toString()))
-                .toString();
+                .put("amount_minor", amount);
+        if (quoteToken != null) {
+            body.put("quote_token", quoteToken);
+        }
+        return body.toString();
     }
 
     /** A mandate valid from a minute ago: the signer's clock may run ahead of the database's NOW(). */
@@ -158,6 +180,58 @@ class AlakaHttpControllerTest {
         Reply drift = post("/v1/spends", token, spendJson(mandate, agent, "k5", MERCHANT, 1_000, 900));
         assertThat(drift.status()).isEqualTo(422);
         assertThat(drift.body().path("error").path("code").asText()).isEqualTo("QuoteDrift.PRICE");
+    }
+
+    @Test
+    void unsignedTamperedReplayedOrUntrustedQuotesAre422BeforePostgres() throws Exception {
+        UUID mandate = UUID.randomUUID();
+        String agent = "agent-" + UUID.randomUUID();
+        String token = token(mandate, agent, List.of(MERCHANT));
+        assertThat(register(token).status()).isEqualTo(201);
+        String approved = approver.sign(quoteClaims(mandate, agent, "k1", MERCHANT, 2_000, 100, "quote-http"));
+
+        // The pre-signing API shape (an unsigned "quote" object) is refused outright.
+        String legacy = JSON.createObjectNode().put("mandate_id", mandate.toString()).put("agent_id", agent)
+                .put("idempotency_key", "k1").put("merchant_id", MERCHANT).put("currency", "USD").put("amount_minor", 2_000)
+                .<com.fasterxml.jackson.databind.node.ObjectNode>set("quote", JSON.createObjectNode()
+                        .put("merchant_id", MERCHANT).put("quoted_amount_minor", 9_000))
+                .toString();
+        assertThat(post("/v1/spends", token, legacy).status()).isEqualTo(400);
+
+        assertInvalidQuote(token, spendJson(mandate, agent, "k1", MERCHANT, 2_000, (String) null), "MALFORMED");
+        assertInvalidQuote(token, spendJson(mandate, agent, "k1", MERCHANT, 9_000,
+                withPayload(approved, quoteClaims(mandate, agent, "k1", MERCHANT, 9_000, 100, "quote-http")
+                        .canonicalBytes())), "BAD_SIGNATURE");
+        assertInvalidQuote(token, spendJson(mandate, agent, "k1", MERCHANT, 4_000,
+                withPayload(approved, quoteClaims(mandate, agent, "k1", MERCHANT, 2_000, 10_000, "quote-http")
+                        .canonicalBytes())), "BAD_SIGNATURE");
+        assertInvalidQuote(token, spendJson(mandate, agent, "k2", MERCHANT, 2_000, approved), "MISMATCH");
+        String issuerSigned = new MudraQuoteSigner("kid-http", issuer.getPrivate())
+                .sign(quoteClaims(mandate, agent, "k1", MERCHANT, 2_000, 100, "kid-http"));
+        assertInvalidQuote(token, spendJson(mandate, agent, "k1", MERCHANT, 2_000, issuerSigned), "UNKNOWN_KEY");
+
+        try (Connection c = db.openAppConnection();
+                PreparedStatement ps = c.prepareStatement("SELECT count(*) FROM payment_intents WHERE mandate_id = ?")) {
+            ps.setObject(1, mandate);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                assertThat(rs.getLong(1)).as("no rejected quote reached the ledger").isZero();
+            }
+        }
+        Reply honest = post("/v1/spends", token, spendJson(mandate, agent, "k1", MERCHANT, 2_000, approved));
+        assertThat(honest.status()).isEqualTo(200);
+        assertThat(honest.body().path("status").asText()).isEqualTo("CAPTURED");
+    }
+
+    private static void assertInvalidQuote(String token, String body, String reason) throws Exception {
+        Reply reply = post("/v1/spends", token, body);
+        assertThat(reply.status()).isEqualTo(422);
+        assertThat(reply.body().path("error").path("code").asText()).isEqualTo("InvalidQuote." + reason);
+    }
+
+    private static String withPayload(String token, byte[] payload) {
+        String[] parts = token.split("\\.");
+        return parts[0] + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(payload) + "." + parts[2];
     }
 
     @Test

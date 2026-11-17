@@ -28,7 +28,9 @@ final class StripeJson {
      * <ul>
      *   <li>{@code requires_payment_method}, {@code requires_confirmation}, {@code requires_action},
      *       {@code requires_capture}: no money has moved and {@code /cancel} is accepted, so
-     *       {@link RailPiStatus#REQUIRES_CONFIRMATION};
+     *       {@link RailPiStatus#REQUIRES_CONFIRMATION}. ({@code requires_capture} only occurs with
+     *       manual capture, which {@link StripeHttpPaymentRail} never requests; supporting it would
+     *       need its own state, or recovery would cancel an authorisation meant to be captured.)
      *   <li>{@code processing}: {@link RailPiStatus#PROCESSING};
      *   <li>{@code succeeded}: {@link RailPiStatus#SUCCEEDED}, charged {@code amount_received};
      *   <li>{@code canceled}: {@link RailPiStatus#CANCELED}.

@@ -42,7 +42,7 @@ the storm and the chaos suite all use it, and it reads three independent sources
 
 ```
                    agent runtime
-                         |  POST /v1/spends   (X-Mudra-Token, spend + approved quote)
+                         |  POST /v1/spends   (X-Mudra-Token, spend + signed quote_token)
                          v
   +-----------------------------------------------------------------------+
   | alaka-core   dev.alaka.core                                           |
@@ -63,7 +63,7 @@ the storm and the chaos suite all use it, and it reads three independent sources
 |---------|----------------|-----------|
 | `dev.alaka.core` | Execution coordinator, idempotency gate, runtime modes, HTTP | `SpendEngine`, `HardenedSpendEngine`, `NaiveSpendEngine`, `SpendGateway`, `RailCallGuard`, `http.AlakaHttpController` |
 | `dev.alaka.nidhi` | Ledger SQL, transactions, retry, error translation | `NidhiLedger`, `TransactionRunner`, `SqlStates`, `NidhiException` (sealed) |
-| `dev.alaka.mudra` | Capability tokens and quote-to-settlement drift | `MudraTokenSigner`, `MudraTokenVerifier`, `MudraMandateClaims`, `QuoteDriftEvaluator` |
+| `dev.alaka.mudra` | Capability tokens, signed quotes and quote-to-settlement drift | `MudraTokenSigner`, `MudraTokenVerifier`, `MudraMandateClaims`, `MudraQuoteSigner`, `MudraQuoteVerifier`, `MudraQuoteClaims`, `MudraCodec`, `QuoteDriftEvaluator` |
 | `dev.alaka.yaksha` | Rail port and adapters, webhooks, crash recovery | `PaymentRailPort`, `StripeHttpPaymentRail`, `StripeWebhookVerifier`, `StripeWebhookHandler`, `YakshaRecoverySweeper`, `SimulatedPaymentRail` |
 
 Runtime modes (`--mode=` / `alaka.mode`):
@@ -211,6 +211,9 @@ The model was also checked for vacuity and for sensitivity to bugs (Milestone 1)
   - `CAPTURE`: HELD to SETTLED, plus the remainder to AVAILABLE.
 - Composite foreign keys `(tx_id, mandate_id, currency)` and `(account_id, mandate_id, currency)`
   make cross-mandate or cross-currency postings unrepresentable (23503).
+- `migrations/003_index_postings_mandate.sql` indexes `ledger_postings (mandate_id)`. The per-commit
+  balance cross-check filters on that column; without the index it is a full-table scan, which
+  under SSI made unrelated mandates conflict (section 6.2).
 
 ### Why conservation cannot be a `CHECK` constraint
 
@@ -281,23 +284,62 @@ The answer to "is the upfront lock needed for correctness?" is no: the database 
 invariant under READ COMMITTED. The lock changes where contention is paid. Without it, losers do all
 their writes and learn of the failure at COMMIT; with it, they queue before writing anything.
 
-### 6.2 Fifty virtual threads, retry storm (`ConcurrencyStormTest`)
+### 6.2 Fifty virtual threads: one hot mandate vs ten (`ConcurrencyStormTest`)
 
-The workload: one mandate with a budget of 10,000 and a per-transaction cap of 2,000. 40 distinct
-spends of 1,000 each (demand is 4× the budget), plus 10 retries re-sending keys already in use, half
-of them with a tampered payload. All 50 threads are released by one latch, and rail latency is
-5–15 ms so that check-then-act windows overlap. The ranges below are across seven full runs.
+**Single mandate.** One mandate with a budget of 10,000 and a per-transaction cap of 2,000. 40
+distinct spends of 1,000 each (demand is 4× the budget), plus 10 retries re-sending keys already in
+use, half of them with a tampered payload. All 50 threads are released by one latch, and rail
+latency is 5–15 ms so that check-then-act windows overlap.
 
-| Mode | Rail charged / budget | Invariant violations | `40001` retries | p50 / p95 / p99 latency |
-|------|----------------------|----------------------|-----------------|-------------------------|
-| `naive` | **34,996 – 39,995** / 10,000 | 14–18 per run (I1 ×3, I2 ×10–14, I3 ×1) | 0 | ≈ 190 / 220 / 230 ms |
-| `hardened-pessimistic` | **10,000** / 10,000 every run | 0 | 0 | ≈ 1.5 / 2.5 / 2.7 s |
-| `hardened-ssi` | **9,999 – 10,000** / 10,000 | 0 | **637 – 790**, never exhausting the budget | ≈ 1.8 / 2.4 / 2.5 s |
+Counts are ranges across twelve full runs. Latencies are from one run with migration `003`
+applied, the same run the README quotes.
 
-- **Why 9,999:** for one key, a tampered 999 request won the race and became the stored request, so
-  the original 1,000 was rejected with 422. The ledger and the rail agree on 9,999.
-- **What the latencies are:** they come from serialising 50 writers on one balance row from a laptop
-  through Docker Desktop's network. They are not a throughput benchmark; see section 10.
+| Mode | Rail charged / budget | Invariant violations | `40001` retries | p50 / p95 / p99 (ms) |
+|------|----------------------|----------------------|-----------------|---------------------:|
+| `naive` | **34,996 – 49,995** / 10,000 | 14–24 per run (I1 ×3, I2 ×10–20, I3 ×1) | 0 | 171 / 193 / 197 |
+| `hardened-pessimistic` | **10,000** / 10,000 every run | 0 | 0 | 1,816 / 3,067 / 3,196 |
+| `hardened-ssi` | **9,997 – 10,000** / 10,000 | 0 | **637 – 865**, never exhausting the budget | 1,890 / 2,438 / 2,462 |
+
+- **Why below 10,000:** tampered 999 requests won the race for their keys and became the stored
+  requests, so the original 1,000s were rejected with 422. The ledger and the rail agree.
+- **The worst `naive` run (49,995)** charged every duplicate retry as well.
+
+**Ten mandates.** Ten engines, each with its own simulated rail and mandate (budget 10,000, cap
+3,000), share one connection pool. Five threads per mandate spend 3,000 each, all 50 released by
+one latch, so each mandate fits three spends and rejects two with `SG003`. Every run charged exactly
+90,000 of 100,000, with 0 invariant violations and 0 `40P01` (asserted through `EngineMetrics`,
+since the pessimistic mode retries deadlocks silently). Two runs before and three after migration
+`003` (the third "after" run is the final `verify-all.sh --wide` run):
+
+| Mode, schema | `40001` | p50 / p95 / p99 (ms) | `ledger_postings` seq / index scans |
+|--------------|--------:|---------------------:|------------------------------------:|
+| pessimistic, 001–002 | 0, 0 | 329 / 422 / 437; 313 / 382 / 386 | 79 / 78; 70 / 65 |
+| pessimistic, with 003 | 0, 0, 0 | 341 / 455 / 492; 288 / 360 / 390; 301 / 382 / 408 | 11 / 117; 11 / 110; 11 / 154 |
+| SSI, 001–002 | **1,121, 1,093** | 2,286 / 2,874 / 2,967; 1,991 / 2,646 / 2,716 | 613 / 664; 677 / 721 |
+| SSI, with 003 | **521, 586, 438** | 1,014 / 1,242 / 1,295; 1,149 / 1,475 / 1,517; 1,007 / 1,228 / 1,269 | 10 / 536; 10 / 566; 10 / 524 |
+
+The scan counters are `pg_stat_user_tables` deltas over the storm and its invariant check; the
+check itself accounts for about 10 scans.
+
+What the two tables show:
+
+- **Pessimistic scales with independent mandates.** p50 drops from about 1.8 s on one hot row to
+  about 0.3 s across ten.
+- **SSI did not scale before `003`.** Ten mandates sharing no rows produced more serialization
+  failures than fifty threads on one mandate.
+
+The cause is the deferred integrity trigger's per-commit `SUM` over `ledger_postings WHERE
+mandate_id = …`. Migration 001 has no index leading on `mandate_id`, so the query is a sequential
+scan. Under SSI a sequential scan takes a relation-level SIREAD predicate lock, so every writer
+of any posting conflicts with every other.
+
+`003` adds `ledger_postings (mandate_id)`. Sequential scans fall to about 10 (the invariant check's
+own reads), and cross-mandate `40001` and p50 roughly halve. The residual conflicts come from
+page-granular predicate locks on a still-small index.
+
+**What the latencies are.** They come from a laptop through Docker Desktop's network, and are not a
+throughput benchmark; see section 10. Single-mandate pessimistic p50 varied between about 1.5 s and
+2.0 s across runs, with and without `003`, because fifty writers queue on one balance row.
 
 ## 7. Faults: timeouts, crashes, network chaos
 
@@ -366,20 +408,48 @@ prefix under a domain tag, so the encoding is unambiguous. The allowlist is sort
 and non-canonical encodings are rejected, so each grant has exactly one byte form. The key id is
 inside the signed bytes.
 
+A purchase is approved by a second Ed25519 token, signed by the approving party (the user, or an
+approval service), never by the agent:
+
+```
+mudraq1.<base64url(canonical quote claims)>.<base64url(signature)>
+```
+
+The quote claims are `mandate_id`, `agent_id`, `idempotency_key`, `merchant_id`, `currency`,
+`quoted_amount_minor`, `max_slippage_bps`, `expires_at` and `quote_kid`.
+
+- **Shared encoding.** Both token types use `MudraCodec`: the same length-prefixed encoding and the
+  same signature envelope, under different domain tags (`alaka-mudra-mandate-v1`,
+  `alaka-mudra-quote-v1`). A mandate token relabelled as a quote does not verify.
+- **Separate trust.** Quote keys form their own trust set (`alaka.mudra.trusted-quote-keys`), so a
+  mandate issuer's key cannot approve purchases.
+- **One approval, one purchase.** The quote is bound to `idempotency_key`, and
+  `UNIQUE (agent_id, idempotency_key)` admits one intent per key. An approval can therefore
+  authorise at most one intent, with no schema change.
+
 `SpendGateway` runs, before any database statement:
 
-- **Token verification.** The signature must verify under a trusted key id, and the token must grant
-  this mandate to this agent. Anything else raises `BadSignature`, `UnknownKey`, `MandateMismatch`
-  or `MalformedToken`.
-- **Quote drift.** The merchant and currency must equal the approved quote's, the quote must be
-  unexpired, and the amount must satisfy `amount × 10000 ≤ quoted × (10000 + max_slippage_bps)`.
-  That is compared exactly, so there is no rounding: quote 10,000 with 50 bps accepts 10,050 and
-  rejects 10,051; quote 999 with 50 bps accepts 1,003 and rejects 1,004.
+- **Mandate token verification.** The signature must verify under a trusted issuer key, and the
+  token must grant this mandate to this agent. Anything else raises `BadSignature`, `UnknownKey`,
+  `MandateMismatch` or `MalformedToken`.
+- **Quote token verification.** The signature must verify under a trusted approver key, and the
+  quote must name this request's mandate, agent and idempotency key. Anything else raises
+  `InvalidQuote` with a reason: `MALFORMED`, `UNKNOWN_KEY`, `BAD_SIGNATURE` or `MISMATCH`. An agent
+  that raises `quoted_amount_minor` or `max_slippage_bps` breaks the signature; one that replays an
+  approval under a new key gets `MISMATCH`.
+- **Quote drift**, against the signed values. The merchant and currency must equal the quote's, the
+  quote must be unexpired, and the amount must satisfy
+  `amount × 10000 ≤ quoted × (10000 + max_slippage_bps)`. That is compared exactly, so there is no
+  rounding: quote 10,000 with 50 bps accepts 10,050 and rejects 10,051; quote 999 with 50 bps
+  accepts 1,003 and rejects 1,004.
 
-A test with an engine that throws on any call proves that forged tokens and drifted quotes never
-reach Postgres. The verifier deliberately does not judge the validity window on the application
-clock. Postgres checks it with `NOW()` on every reservation (I4), and issuers backdate `not_before`
-to absorb clock skew between their clock and the database's.
+A test with an engine that throws on any call proves that forged mandate tokens, tampered,
+replayed or untrusted quotes, and drifted amounts never reach Postgres. The HTTP test also checks
+the database afterwards and finds no intent.
+
+The mandate verifier deliberately does not judge the validity window on the application clock.
+Postgres checks it with `NOW()` on every reservation (I4), and issuers backdate `not_before` to
+absorb clock skew between their clock and the database's.
 
 ## 9. HTTP surface
 
@@ -390,7 +460,7 @@ rules. JSON is snake_case.
 |----------|---------|--------|
 | `POST /v1/mandates` `{"token"}` | 201 | 422 invalid token; 409 already registered |
 | `POST /v1/mandates/{id}/revoke` | 200 | 409 already terminal (SG004); 404 unknown |
-| `POST /v1/spends` (header `X-Mudra-Token`; spend + `quote`) | 200 terminal; 202 still settling (rail `processing`, or recovery could not reach the rail) | 409 + `Retry-After` while in flight; 422 payload mismatch / Mudra / quote drift / SG002; 402 SG003; 403 SG001 / SG008; 400 missing header; 503 + `Retry-After` if serialization retries run out |
+| `POST /v1/spends` (header `X-Mudra-Token`; spend + `quote_token`) | 200 terminal; 202 still settling (rail `processing`, or recovery could not reach the rail) | 409 + `Retry-After` while in flight; 422 payload mismatch / mandate token / `InvalidQuote.<reason>` / `QuoteDrift.<reason>` / SG002; 402 SG003; 403 SG001 / SG008; 400 missing header or an unsigned `quote` object; 503 + `Retry-After` if serialization retries run out |
 | `POST /v1/webhooks/stripe` | 200 `{"disposition": APPLIED / DUPLICATE / IGNORED}` | 400 missing, malformed, stale or wrong signature |
 
 `AlakaHttpControllerTest` starts the real Spring Boot application against Postgres and the mock
@@ -410,15 +480,29 @@ What the evidence covers, and what it does not:
 
   It also assumes two Stripe behaviours: that `/cancel` of a canceled payment intent fails, and that
   a failed `processing` ends cancelable.
-- **The quote is not attested.** `POST /v1/spends` accepts the approved quote in the agent's request
-  body. The drift check protects against honest drift (a price that changed between approval and
-  settlement), but not against a compromised agent that fabricates its own quote. A production
-  deployment must have the approving user or merchant sign the quote, verified the same way as the
-  mandate.
+- **Quotes are only as trustworthy as the approver's key.** The agent can no longer fabricate, edit
+  or reuse an approval (section 8), but whoever holds a key in `alaka.mudra.trusted-quote-keys` can
+  approve any purchase within the mandate. Key storage, rotation and revocation are not
+  implemented.
+- **Quote expiry is judged on the application clock**, before Phase 1. A retry of a completed
+  request after its quote expired gets `422 QuoteDrift.QUOTE_EXPIRED` instead of the stored result.
+- **Partial capture is verified but not reachable on Stripe.** The TLA+ model and the ledger kernel
+  support `captured_amount_minor < authorized_amount_minor`, with the remainder returning to
+  AVAILABLE, and the property suite drives it through `SimulatedPaymentRail`.
+  `StripeHttpPaymentRail` sends `capture_method=automatic`, under which Stripe captures a card
+  payment in full; the mock Stripe server refuses anything else. Reaching partial capture on Stripe
+  needs three things, none implemented:
+  - `capture_method=manual` and `/capture`;
+  - an `AUTHORIZED` state in the protocol and the model, so recovery does not cancel an
+    authorisation meant to be captured;
+  - a persisted capture amount.
+- **SSI keeps some false conflicts across mandates** even with the `003` index (438–586 `40001` in
+  the ten-mandate storm), because predicate locks are page-granular. The pessimistic mode has none.
 - **Bounded loss, not zero loss.** The guarantees bound what can go wrong; they do not make a
   compromised agent harmless:
-  - A compromised agent with a valid token can still spend up to the mandate's budget at allowlisted
-    merchants. I1 caps the damage at `total_budget_minor`.
+  - A compromised agent with a valid mandate token and approvals from a trusted approver can still
+    spend up to the mandate's budget at allowlisted merchants. I1 caps the damage at
+    `total_budget_minor`.
   - A dead-lettered `processing` intent keeps its hold, so budget stays locked until a human or a
     later webhook resolves it. Locked, not lost.
   - Orphaned unconfirmed payment intents can accumulate on the rail. They can never charge, but

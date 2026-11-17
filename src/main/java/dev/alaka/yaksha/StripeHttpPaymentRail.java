@@ -22,10 +22,16 @@ import java.util.UUID;
  * same adapter talks to {@code https://api.stripe.com} in test mode, to an in-process mock in
  * integration tests, or through a fault-injecting proxy in chaos tests.
  *
- * <p>Calls: {@code POST /v1/payment_intents} ({@code confirm=false}, {@code Idempotency-Key:
- * create_<intentId>}), {@code POST /v1/payment_intents/{id}/confirm} ({@code Idempotency-Key:
- * confirm_<intentId>}), {@code GET /v1/payment_intents/{id}} and
- * {@code POST /v1/payment_intents/{id}/cancel}.
+ * <p>Calls: {@code POST /v1/payment_intents} ({@code confirm=false},
+ * {@code capture_method=automatic}, {@code Idempotency-Key: create_<intentId>}),
+ * {@code POST /v1/payment_intents/{id}/confirm} ({@code Idempotency-Key: confirm_<intentId>}),
+ * {@code GET /v1/payment_intents/{id}} and {@code POST /v1/payment_intents/{id}/cancel}.
+ *
+ * <p>With automatic capture, a succeeded card payment's {@code amount_received} equals its
+ * {@code amount}, so this adapter never produces a partial capture. The ledger and the TLA+ model
+ * support one ({@code captured_amount_minor < authorized_amount_minor}, remainder back to
+ * {@code MANDATE_AVAILABLE}); reaching it on Stripe would need manual capture plus an
+ * {@code AUTHORIZED} protocol state.
  *
  * <p>Error mapping, chosen so that the engine never draws a conclusion Stripe did not state:
  * <ul>
@@ -94,6 +100,10 @@ public final class StripeHttpPaymentRail implements PaymentRailPort {
         form.put("amount", Long.toString(amountMinor));
         form.put("currency", currency.toLowerCase(Locale.ROOT));
         form.put("confirm", "false");
+        // Automatic capture: a successful confirm charges the full amount. Partial capture needs
+        // capture_method=manual, a /capture call and an AUTHORIZED state this adapter does not
+        // implement, so it is pinned explicitly rather than left to the API version's default.
+        form.put("capture_method", "automatic");
         form.put("payment_method_types[]", "card");
         form.put("metadata[intent_id]", intentId.toString());
         form.put("metadata[merchant_id]", merchantId);

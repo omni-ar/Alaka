@@ -146,25 +146,12 @@ class StripeWireIntegrationTest {
                 .containsEntry("amount", "4000")
                 .containsEntry("currency", "usd")
                 .containsEntry("confirm", "false")
+                .containsEntry("capture_method", "automatic")
                 .containsEntry("metadata[intent_id]", id.toString())
                 .containsEntry("metadata[merchant_id]", MERCHANT);
         MockStripeServer.Recorded confirm = calls.get(1);
         assertThat(confirm.headers()).containsEntry("idempotency-key", "confirm_" + id);
         assertThat(confirm.form()).containsEntry("payment_method", "pm_card_visa");
-    }
-
-    @Test
-    void partialCaptureOverTheWireReleasesTheRemainder() {
-        Fixture f = new Fixture(RuntimeMode.HARDENED_PESSIMISTIC);
-        UUID id = f.engine.reserve(f.request(4_000)).intent().intentId();
-        f.stripe.state.setConfirmBehavior(id, ConfirmBehavior.succeedPartial(2_500));
-        f.engine.createOnRail(id);
-        f.engine.confirmOnRail(id);
-
-        IntentView captured = f.engine.capture(id);
-        assertThat(captured.capturedAmountMinor()).isEqualTo(2_500);
-        f.assertBalances(7_500, 0, 2_500);
-        assertThat(f.stripe.requestsTo(captured.railPaymentIntentId())).hasSize(1); // capture() read it with GET
     }
 
     @Test
