@@ -18,6 +18,7 @@ import dev.alaka.nidhi.NidhiException;
 import dev.alaka.testsupport.NidhiPostgres;
 import dev.alaka.yaksha.ConfirmBehavior;
 import dev.alaka.yaksha.ConfirmBehavior.RailFault;
+import dev.alaka.yaksha.PaymentRailPort;
 import dev.alaka.yaksha.RailException;
 import dev.alaka.yaksha.RailPiStatus;
 import dev.alaka.yaksha.SimulatedPaymentRail;
@@ -33,7 +34,6 @@ import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import net.jqwik.api.Tuple;
-import net.jqwik.api.lifecycle.AfterContainer;
 import net.jqwik.api.lifecycle.BeforeContainer;
 import net.jqwik.api.state.Action;
 import net.jqwik.api.state.ActionChain;
@@ -60,16 +60,20 @@ class SpendLifecycleProperties {
     private static HikariDataSource engineData;
     private static HikariDataSource truthData;
 
-    @BeforeContainer
-    static void startPools() {
-        engineData = NidhiPostgres.shared().newAppDataSource(8);
-        truthData = NidhiPostgres.shared().newAppDataSource(2);
+    /**
+     * Pools shared by this suite and {@link TraceRefinementProperties}, created on first use and
+     * left open until the JVM exits (HikariCP's housekeeping threads are daemons).
+     */
+    static synchronized void ensurePools() {
+        if (engineData == null) {
+            engineData = NidhiPostgres.shared().newAppDataSource(8);
+            truthData = NidhiPostgres.shared().newAppDataSource(2);
+        }
     }
 
-    @AfterContainer
-    static void closePools() {
-        engineData.close();
-        truthData.close();
+    @BeforeContainer
+    static void startPools() {
+        ensurePools();
     }
 
     @Property(tries = 30)
@@ -98,7 +102,18 @@ class SpendLifecycleProperties {
     }
 
     private static Arbitrary<ActionChain<World>> chains(RuntimeMode mode) {
-        return ActionChain.startWith(() -> new World(mode))
+        return chains(mode, false);
+    }
+
+    /**
+     * The action chains of this suite.
+     *
+     * @param mode hardened mode under test
+     * @param traced record every step for trace validation ({@link RefinementTracer})
+     * @return the chain arbitrary
+     */
+    static Arbitrary<ActionChain<World>> chains(RuntimeMode mode, boolean traced) {
+        return ActionChain.startWith(() -> new World(mode, traced))
                 .withAction(6, new ReserveAction())
                 .withAction(2, new OnOpenIntent("DuplicateRetry", World::duplicateRetry, null))
                 .withAction(2, new OnOpenIntent("TamperedPayloadRetry", World::tamperedRetry, null))
@@ -144,10 +159,13 @@ class SpendLifecycleProperties {
     static final class World {
         final RuntimeMode mode;
         final SimulatedPaymentRail rail = new SimulatedPaymentRail();
+        /** The rail as the engine sees it: {@link #rail} itself, or the tracer's view of it. */
+        final PaymentRailPort railPort;
         final SpendEngine engine;
         final String agent = "agent-" + UUID.randomUUID();
         final UUID mandate;
         final InvariantChecker checker;
+        final RefinementTracer tracer;
         final Map<String, ModelIntent> intents = new LinkedHashMap<>();
         long available = BUDGET;
         long held;
@@ -155,12 +173,31 @@ class SpendLifecycleProperties {
         boolean revoked;
         int nextKey;
 
-        World(RuntimeMode mode) {
+        World(RuntimeMode mode, boolean traced) {
+            ensurePools();
             this.mode = mode;
-            this.engine = SpendEngines.create(mode, engineData, rail);
+            if (traced) {
+                this.tracer = new RefinementTracer(truthData, rail);
+                this.railPort = tracer.rail();
+                this.engine = tracer.engine(SpendEngines.create(mode, engineData, railPort));
+            } else {
+                this.tracer = null;
+                this.railPort = rail;
+                this.engine = SpendEngines.create(mode, engineData, rail);
+            }
             this.mandate = engine.createMandate(new NewMandate(
                     agent, "USD", BUDGET, CAP, List.of(MERCHANT), Duration.ofHours(1), "kid-property"));
+            if (tracer != null) {
+                tracer.start(mandate);
+            }
             this.checker = new InvariantChecker(engine, rail, truthData, mandate, BUDGET, CAP);
+        }
+
+        /** Records a state after a rail-side event the test drove directly. */
+        private void traceRailEvent() {
+            if (tracer != null) {
+                tracer.snapshot();
+            }
         }
 
         List<String> keys(Expect expect) {
@@ -279,7 +316,7 @@ class SpendLifecycleProperties {
             engine.createOnRail(intent.intentId);
             assertThat(engine.confirmOnRail(intent.intentId).status()).isEqualTo(RailPiStatus.PROCESSING);
             String piId = engine.findIntent(intent.intentId).orElseThrow().railPaymentIntentId();
-            assertThatThrownBy(() -> rail.cancel(piId)).isInstanceOf(RailException.CancelRejected.class);
+            assertThatThrownBy(() -> railPort.cancel(piId)).isInstanceOf(RailException.CancelRejected.class);
             outcome("ProcessingRejectsCancel", "hold kept while PROCESSING");
             assertThat(engine.recoverOrVoid(intent.intentId).status()).isEqualTo(IntentStatus.CONFIRMING);
             intent.expect = Expect.PROCESSING;
@@ -290,6 +327,7 @@ class SpendLifecycleProperties {
             String piId = engine.findIntent(intent.intentId).orElseThrow().railPaymentIntentId();
             if (succeeded) {
                 rail.resolveProcessingAsSucceeded(piId, charged);
+                traceRailEvent();
                 outcome("ResolveProcessing", charged == 0 ? "succeeded in full, captured" : "succeeded partially, captured");
                 IntentView after = engine.recoverOrVoid(intent.intentId);
                 long expected = charged == 0 ? intent.request.amountMinor() : charged;
@@ -298,6 +336,7 @@ class SpendLifecycleProperties {
                 settle(intent, expected);
             } else {
                 rail.resolveProcessingAsCanceled(piId);
+                traceRailEvent();
                 outcome("ResolveProcessing", "failed on the rail, voided");
                 assertThat(engine.recoverOrVoid(intent.intentId).status()).isEqualTo(IntentStatus.VOIDED);
                 release(intent);
