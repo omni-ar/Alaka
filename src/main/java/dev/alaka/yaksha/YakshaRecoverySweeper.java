@@ -8,7 +8,9 @@ import java.sql.ResultSet;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import javax.sql.DataSource;
@@ -29,11 +31,18 @@ import javax.sql.DataSource;
  *   <li>outside any transaction, runs {@code recoverOrVoid} on each claimed intent (rail calls);
  *   <li>records the result: {@code COMPLETED} if the intent is terminal; otherwise (the rail is
  *       still processing, or recovery failed) back to {@code PENDING} with exponential backoff, or
- *       {@code DEAD_LETTER} once {@code maxAttempts} is reached. A dead-lettered intent keeps its
- *       hold: nothing is released until a human or a later event resolves it.
+ *       {@code DEAD_LETTER} once {@code maxAttempts} is reached.
  * </ol>
  * Result updates only apply while this sweeper still holds the claim (same status and attempt
  * number), so a sweeper whose lease expired cannot overwrite a newer claim.
+ *
+ * <p>{@code DEAD_LETTER} means "stop retrying fast, and alert" ({@link #stats()}), not "never look
+ * again". A dead-lettered intent keeps its hold, because releasing it while the rail may still
+ * charge would break I6. It is still resolved without an operator in two ways. A verified
+ * {@code payment_intent.succeeded} or {@code .canceled} webhook settles the intent and completes
+ * the task. And every {@code deadLetterRecheck}, the sweeper claims the task again for one more
+ * recovery attempt; if the rail has since reached a terminal state, the intent is settled and
+ * the task completed, otherwise it returns to {@code DEAD_LETTER} until the next recheck.
  */
 public final class YakshaRecoverySweeper {
 
@@ -45,10 +54,12 @@ public final class YakshaRecoverySweeper {
      * @param maxAttempts attempts before a task is dead-lettered
      * @param baseBackoff delay after the first failed attempt, doubled per attempt
      * @param maxBackoff upper bound of the delay
+     * @param deadLetterRecheck how long a dead-lettered task rests before one more attempt
      */
-    public record Options(int batchSize, Duration lease, int maxAttempts, Duration baseBackoff, Duration maxBackoff) {
+    public record Options(int batchSize, Duration lease, int maxAttempts, Duration baseBackoff, Duration maxBackoff,
+            Duration deadLetterRecheck) {
 
-        /** Defaults: 50 tasks, 60 s lease, 10 attempts, backoff 1 s doubling up to 5 min. */
+        /** Defaults: 50 tasks, 60 s lease, 10 attempts, backoff 1 s doubling up to 5 min, recheck 15 min. */
         public static final Options DEFAULTS =
                 new Options(50, Duration.ofSeconds(60), 10, Duration.ofSeconds(1), Duration.ofMinutes(5));
 
@@ -59,7 +70,25 @@ public final class YakshaRecoverySweeper {
             Objects.requireNonNull(lease, "lease");
             Objects.requireNonNull(baseBackoff, "baseBackoff");
             Objects.requireNonNull(maxBackoff, "maxBackoff");
+            Objects.requireNonNull(deadLetterRecheck, "deadLetterRecheck");
         }
+
+        /** Options with the default 15 minute dead-letter recheck. */
+        public Options(int batchSize, Duration lease, int maxAttempts, Duration baseBackoff, Duration maxBackoff) {
+            this(batchSize, lease, maxAttempts, baseBackoff, maxBackoff, Duration.ofMinutes(15));
+        }
+    }
+
+    /**
+     * Recovery backlog, for monitoring.
+     *
+     * @param tasksByStatus number of {@code outbox_tasks} per status
+     * @param oldestOverdueSeconds how long the oldest due {@code PENDING} task has waited past its
+     *     {@code next_attempt_at} (sweeper lag); 0 if none is overdue
+     * @param deadLetterHeldMinor budget held by intents whose task is {@code DEAD_LETTER} and that
+     *     are still open: the capital locked until the rail resolves
+     */
+    public record RecoveryStats(Map<String, Long> tasksByStatus, double oldestOverdueSeconds, long deadLetterHeldMinor) {
     }
 
     /**
@@ -138,14 +167,16 @@ public final class YakshaRecoverySweeper {
                             + "  SELECT task_id FROM outbox_tasks"
                             + "   WHERE (status = 'PENDING' AND next_attempt_at <= NOW())"
                             + "      OR (status = 'PROCESSING' AND locked_until < NOW())"
+                            + "      OR (status = 'DEAD_LETTER' AND updated_at <= NOW() - ? * INTERVAL '1 millisecond')"
                             + "   ORDER BY next_attempt_at"
                             + "   LIMIT ? FOR UPDATE SKIP LOCKED)"
                             + " UPDATE outbox_tasks t SET status = 'PROCESSING', attempts = t.attempts + 1,"
                             + "        locked_until = NOW() + ? * INTERVAL '1 millisecond', updated_at = NOW()"
                             + "   FROM due WHERE t.task_id = due.task_id"
                             + " RETURNING t.task_id, t.intent_id, t.attempts")) {
-                ps.setInt(1, options.batchSize());
-                ps.setLong(2, options.lease().toMillis());
+                ps.setLong(1, options.deadLetterRecheck().toMillis());
+                ps.setInt(2, options.batchSize());
+                ps.setLong(3, options.lease().toMillis());
                 List<Claim> claims = new ArrayList<>();
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -154,6 +185,46 @@ public final class YakshaRecoverySweeper {
                 }
                 return claims;
             }
+        });
+    }
+
+    /**
+     * Reads the recovery backlog: tasks per status, sweeper lag, and the budget held by open
+     * dead-lettered intents. Three small aggregate queries; meant for a metrics scrape, not a hot
+     * path.
+     *
+     * @return the current backlog
+     */
+    public RecoveryStats stats() {
+        return tx.read(c -> {
+            Map<String, Long> byStatus = new TreeMap<>();
+            for (String status : List.of("PENDING", "PROCESSING", "COMPLETED", "DEAD_LETTER")) {
+                byStatus.put(status, 0L);
+            }
+            try (PreparedStatement ps = c.prepareStatement("SELECT status, count(*) FROM outbox_tasks GROUP BY status");
+                    ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    byStatus.put(rs.getString(1), rs.getLong(2));
+                }
+            }
+            double lag;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(next_attempt_at)), 0) FROM outbox_tasks"
+                            + " WHERE status = 'PENDING' AND next_attempt_at <= NOW()");
+                    ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                lag = rs.getDouble(1);
+            }
+            long held;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT COALESCE(SUM(i.authorized_amount_minor), 0) FROM outbox_tasks t"
+                            + " JOIN payment_intents i USING (intent_id)"
+                            + " WHERE t.status = 'DEAD_LETTER' AND i.status NOT IN ('CAPTURED', 'VOIDED', 'FAILED')");
+                    ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                held = rs.getLong(1);
+            }
+            return new RecoveryStats(Map.copyOf(byStatus), lag, held);
         });
     }
 

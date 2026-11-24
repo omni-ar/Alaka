@@ -367,6 +367,44 @@ class StripeWireIntegrationTest {
         assertThat(attempts(inFlight)).isEqualTo(2);
     }
 
+    @Test
+    void deadLetteredIntentsAreResolvedByRecheckOrLateWebhookWithoutAnOperator() throws SQLException {
+        Fixture f = new Fixture(RuntimeMode.HARDENED_PESSIMISTIC, Duration.ZERO, Duration.ofSeconds(5));
+        YakshaRecoverySweeper fast = new YakshaRecoverySweeper(dataSource, f.engine,
+                new YakshaRecoverySweeper.Options(500, Duration.ofSeconds(30), 1, Duration.ZERO, Duration.ZERO));
+        UUID[] stuck = new UUID[2];
+        for (int n = 0; n < 2; n++) {
+            UUID id = f.engine.reserve(f.request(1_000)).intent().intentId();
+            f.stripe.state.setConfirmBehavior(id, ConfirmBehavior.enterProcessing());
+            f.engine.createOnRail(id);
+            f.engine.confirmOnRail(id);
+            stuck[n] = id;
+        }
+        long heldBefore = fast.stats().deadLetterHeldMinor();
+        Sweeps.until(fast, () -> taskStatus(stuck[0]).equals("DEAD_LETTER") && taskStatus(stuck[1]).equals("DEAD_LETTER"));
+        YakshaRecoverySweeper.RecoveryStats dead = fast.stats();
+        assertThat(dead.deadLetterHeldMinor()).as("locked capital is visible").isEqualTo(heldBefore + 2_000);
+        assertThat(dead.tasksByStatus().get("DEAD_LETTER")).isGreaterThanOrEqualTo(2L);
+        f.assertBalances(8_000, 2_000, 0);
+
+        // The rail finally settles the first one; the slow recheck finds it without anyone's help.
+        f.stripe.state.resolveProcessingAsSucceeded(f.intent(stuck[0]).railPaymentIntentId(), 0);
+        YakshaRecoverySweeper recheck = new YakshaRecoverySweeper(dataSource, f.engine,
+                new YakshaRecoverySweeper.Options(500, Duration.ofSeconds(30), 1, Duration.ZERO, Duration.ZERO, Duration.ZERO));
+        Sweeps.until(recheck, () -> taskStatus(stuck[0]).equals("COMPLETED"));
+        assertThat(f.intent(stuck[0]).status()).isEqualTo(IntentStatus.CAPTURED);
+        assertThat(taskStatus(stuck[1])).as("still processing on the rail, still held").isEqualTo("DEAD_LETTER");
+
+        // The second ends in failure on the rail and Stripe says so by webhook.
+        RailPaymentIntent canceled = f.stripe.state.resolveProcessingAsCanceled(f.intent(stuck[1]).railPaymentIntentId());
+        assertThat(f.deliver("evt_" + UUID.randomUUID(), "payment_intent.canceled", canceled).disposition())
+                .isEqualTo(Disposition.APPLIED);
+        assertThat(f.intent(stuck[1]).status()).isEqualTo(IntentStatus.VOIDED);
+        assertThat(taskStatus(stuck[1])).isEqualTo("COMPLETED");
+        f.assertBalances(9_000, 0, 1_000);
+        assertThat(fast.stats().deadLetterHeldMinor()).isEqualTo(heldBefore);
+    }
+
     private static long attempts(UUID intentId) throws SQLException {
         return count("SELECT attempts FROM outbox_tasks WHERE intent_id = ?", intentId);
     }
