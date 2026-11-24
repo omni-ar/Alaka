@@ -111,9 +111,18 @@ public class AlakaConfiguration {
 
     @Bean
     SweeperLoop sweeperLoop(AlakaProperties properties, HikariDataSource alakaDataSource, SpendEngine spendEngine) {
-        YakshaRecoverySweeper sweeper = spendEngine.mode() == RuntimeMode.NAIVE
+        return new SweeperLoop(sweeper(alakaDataSource, spendEngine), properties.recovery().sweepInterval());
+    }
+
+    @Bean
+    AlakaMetrics alakaMetrics(HikariDataSource alakaDataSource, SpendEngine spendEngine) {
+        return new AlakaMetrics(spendEngine, sweeper(alakaDataSource, spendEngine));
+    }
+
+    /** The recovery sweeper, or {@code null} in {@code --mode=naive}, which has no recovery tasks. */
+    private static YakshaRecoverySweeper sweeper(HikariDataSource dataSource, SpendEngine engine) {
+        return engine.mode() == RuntimeMode.NAIVE
                 ? null
-                : new YakshaRecoverySweeper(alakaDataSource, spendEngine, YakshaRecoverySweeper.Options.DEFAULTS);
-        return new SweeperLoop(sweeper, properties.recovery().sweepInterval());
+                : new YakshaRecoverySweeper(dataSource, engine, YakshaRecoverySweeper.Options.DEFAULTS);
     }
 }

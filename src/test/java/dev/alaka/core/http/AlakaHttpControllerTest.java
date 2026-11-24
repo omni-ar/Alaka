@@ -313,6 +313,27 @@ class AlakaHttpControllerTest {
         assertThat(settled.body().path("replayed").asBoolean()).isTrue();
     }
 
+    @Test
+    void prometheusEndpointExportsEngineAndRecoveryMetrics() throws Exception {
+        HttpResponse<String> scrape = HTTP.send(HttpRequest.newBuilder(base.resolve("/actuator/prometheus")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(scrape.statusCode()).isEqualTo(200);
+        assertThat(scrape.body())
+                .contains("alaka_engine_serialization_failures_total{mode=\"hardened-pessimistic\"}")
+                .contains("alaka_engine_deadlocks_total{mode=\"hardened-pessimistic\"}")
+                .contains("alaka_engine_retries_exhausted_total{mode=\"hardened-pessimistic\"}")
+                .contains("alaka_outbox_tasks{status=\"DEAD_LETTER\"}")
+                .contains("alaka_outbox_tasks{status=\"PENDING\"}")
+                .contains("alaka_outbox_oldest_overdue_seconds")
+                .contains("alaka_outbox_dead_letter_held_minor");
+        HttpResponse<String> health = HTTP.send(HttpRequest.newBuilder(base.resolve("/actuator/health")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(health.statusCode()).isEqualTo(200);
+        HttpResponse<String> hidden = HTTP.send(HttpRequest.newBuilder(base.resolve("/actuator/env")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(hidden.statusCode()).as("only health and prometheus are exposed").isEqualTo(404);
+    }
+
     private static Reply webhook(String signature, byte[] event) throws IOException, InterruptedException {
         HttpRequest.Builder request = HttpRequest.newBuilder(base.resolve("/v1/webhooks/stripe"))
                 .header("Content-Type", "application/json")
