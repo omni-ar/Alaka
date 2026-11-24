@@ -6,12 +6,17 @@
 # and nothing in this file is suitable for a production deployment.
 #
 # Host ports are non-default on purpose so this stack does not collide with a
-# Postgres already listening on 5432:
-#   54329 -> postgres:5432    direct connection
-#   54330 -> toxiproxy:54330  reserved for a future Postgres proxy listener
+# Postgres already listening on 5432, and below 49152 on purpose: Windows
+# (Hyper-V / WinNAT) reserves random ranges of the dynamic port range 49152-65535
+# at boot, and once held 54238-54337, making the earlier defaults 54329/54330
+# unbindable. Override with ALAKA_PG_HOST_PORT / ALAKA_TOXI_HOST_PORT.
+#   25432 -> postgres:5432    direct connection
+#   25433 -> toxiproxy:54330  reserved for a future Postgres proxy listener
 #                             (no proxy is configured yet; nothing listens
 #                             there until one is created via the API)
 #   8474  -> toxiproxy:8474   Toxiproxy HTTP API
+# None of the verification gates use these host ports: the SQL gates go through
+# `docker exec`, and the Java tests start their own containers on random ports.
 
 name: alaka
 
@@ -24,7 +29,7 @@ services:
       POSTGRES_PASSWORD: alaka_dev_only
       POSTGRES_DB: alaka
     ports:
-      - "54329:5432"
+      - "${ALAKA_PG_HOST_PORT:-25432}:5432"
     volumes:
       - alaka-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -42,7 +47,7 @@ services:
     command: ["-host=0.0.0.0", "-port=8474"]
     ports:
       - "8474:8474"
-      - "54330:54330"
+      - "${ALAKA_TOXI_HOST_PORT:-25433}:54330"
     depends_on:
       postgres:
         condition: service_healthy
