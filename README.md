@@ -10,10 +10,17 @@ faults:
 - **I6 — no silent drift.** The ledger and the rail never disagree silently: a `VOIDED` intent has
   no succeeded charge, and a `CAPTURED` intent settled exactly what the rail charged.
 
-The repository contains the protocol's TLA+ specification, a PostgreSQL 16 ledger kernel that
-enforces the invariants at `COMMIT`, a Java 21 execution engine with three concurrency modes, a
-Stripe v1 wire adapter, and the test suites that try to break each layer. One command re-runs all of
-it: `bash scripts/verify-all.sh`.
+The repository contains:
+
+- the protocol's TLA+ specification, model-checked by TLC;
+- a trace validator that checks recorded runs of the Java implementation against that
+  specification;
+- a PostgreSQL 16 ledger kernel that enforces the invariants at `COMMIT`;
+- a Java 21 execution engine with three concurrency modes;
+- a Stripe v1 wire adapter;
+- the test suites that try to break each layer.
+
+One command re-runs all of it: `bash scripts/verify-all.sh`.
 
 The rest of this file explains, in order:
 
@@ -214,6 +221,7 @@ stateDiagram-v2
         If recovery exhausts maxAttempts, the outbox_tasks row
         becomes DEAD_LETTER. The intent stays CONFIRMING and
         HELD stays reserved; nothing is released blindly.
+        A late webhook or the 15-minute recheck settles it (8.2).
     end note
 ```
 
@@ -224,6 +232,18 @@ stateDiagram-v2
 | `naive` | `READ COMMITTED`, autocommit | None. App-level check-then-act; records the spend after the rail call | None |
 | `hardened-pessimistic` | `READ COMMITTED` | `spend_mandates FOR SHARE`, then `mandate_balances FOR UPDATE`, then `payment_intents FOR UPDATE`, always in that order | Up to 5 attempts on `40001` / `40P01`; in practice only deadlocks occur |
 | `hardened-ssi` | `SERIALIZABLE` | No explicit balance lock (taking it would make this the pessimistic mode) | Whole-transaction retry on `40001` / `40P01`. At most 100 attempts, with exponential backoff and full jitter (1 ms base, 64 ms cap) |
+
+**Which mode to run.** `hardened-pessimistic` is the default and the recommended mode. A mandate
+is a shared budget counter, and every spend on it writes the same balance row. Queuing on that
+row's lock costs no aborted work, while optimistic concurrency pays for the same contention in
+aborted transactions:
+
+- 637–865 retries for fifty concurrent spends on one mandate (§6.3);
+- before the `003` index, conflicts across unrelated mandates as well (§7.4).
+
+`hardened-ssi` is kept as a measured comparison, and as the fallback for a deployment where
+`SERIALIZABLE` is mandated. In those runs it never exhausted its retry budget, but at higher
+contention it would. Its retry rate is exported as a metric (§8.2).
 
 ---
 
@@ -357,6 +377,65 @@ deadlock check alone did not catch it, because a `CONFIRMING` intent can always 
 
 The mutants are not in this repository. They were re-checked against the current `AlakaInFlight.cfg`
 while this document was written.
+
+### 4.4 Trace validation: does the implementation follow the spec?
+
+Model checking proves the *protocol* is safe; it says nothing about whether the Java engine, the
+PL/pgSQL triggers and the rail adapter actually behave like the protocol. Trace validation checks
+that second claim on concrete runs.
+
+**Recording.** `TraceRefinementProperties` drives the real engine, against PostgreSQL 16 and the
+simulated rail, through random jqwik action chains: the same actions as the stateful property
+suite, including partial captures, `PROCESSING` rails, rejected cancels, lost confirm responses
+and revocation. `RefinementTracer` records the system's abstract state after every engine call,
+every rail call, the departure of every confirm request, and every rail-side event the test
+drives. Each state is one value for every variable of `AlakaInFlight`, read from the ledger rows
+and the rail.
+
+**Checking.** `TraceValidator` writes the runs as a TLA+ module, and TLC checks them with
+`spec/AlakaInFlightTrace.tla`. That module extends the unmodified `AlakaInFlight` and accepts a run
+only if:
+
+- its first state satisfies `Init`;
+- every consecutive pair of states satisfies the spec's `[Next]_vars`, with both bug flags `FALSE`.
+
+A run whose next state is not a legal step leaves TLC without a successor, and TLC reports that as
+a deadlock naming the run and the step.
+
+**The mapping is the claim.** `RefinementTracer` documents it field by field. It contains two
+deliberate abstractions, both safe:
+
+- The spec creates and records a payment intent in one step, so a rail payment intent becomes
+  visible only once the intent row has recorded its `pi_...`. An unrecorded, unconfirmed one
+  cannot charge.
+- A voided reservation that never had a payment intent maps to `CANCELED`, as the spec's
+  `SafeCancelOnRailAndVoid` does.
+
+**Results.** Every recorded run, in both hardened modes, is a behaviour of the spec:
+
+| Mode | Runs | States | TLC | Runs reaching `PROCESSING` | Rejected cancels | Partial captures | Voids |
+|------|-----:|-------:|-----|---------------------------:|-----------------:|-----------------:|------:|
+| `hardened-pessimistic` | 12 | 430 | every run accepted | 10 | 20 | 15 | 34 |
+| `hardened-ssi` | 12 | 450 | every run accepted | 7 | 14 | 21 | 31 |
+
+The test also asserts that each of those columns is non-zero, so an empty run cannot pass.
+
+**Negative controls.** The validator is checked against two tampered copies of real runs, and TLC
+must reject each at the tampered step:
+
+- a one-unit budget leak in a middle state;
+- an intent voided while its rail payment intent is still `PROCESSING`, which is the bug of the
+  cancel-failure counterexample.
+
+Both are rejected exactly there.
+
+**What it does not cover.**
+
+- **Concurrency.** Trace validation covers sequential executions only. Concurrent runs (the storms,
+  the chaos suite) are checked against the invariants by `InvariantChecker`, not against the spec's
+  transitions.
+- **Unmodelled cases.** Cases outside the model (a late create packet, duplicate confirms) are not
+  exercised by these chains.
 
 ---
 
@@ -694,7 +773,7 @@ bash scripts/verify-all.sh                    # tla, sql, concurrency, java; exi
 bash scripts/verify-all.sh --wide             # also the 940,994-state TLC configuration
 bash scripts/verify-all.sh tla                # one gate; others: sql, concurrency, java
 bash scripts/verify-all.sh sql concurrency    # several gates
-./mvnw -B clean verify                        # Java only: 120 tests, 1 skipped without STRIPE_TEST_KEY
+./mvnw -B clean verify                        # Java only: 124 tests, 1 skipped without STRIPE_TEST_KEY
 make verify-all                               # same targets, where make is installed
 ```
 
@@ -727,7 +806,7 @@ done
 ./mvnw -B -DskipTests package
 java -jar target/alaka-0.1.0-SNAPSHOT.jar \
   --alaka.mode=hardened-pessimistic \
-  --alaka.db.url=jdbc:postgresql://localhost:54329/alaka --alaka.db.password=alaka_app_dev_only \
+  --alaka.db.url=jdbc:postgresql://localhost:25432/alaka --alaka.db.password=alaka_app_dev_only \
   --alaka.stripe.secret-key=sk_test_... --alaka.stripe.webhook-secret=whsec_... \
   --alaka.stripe.confirm-payment-method=pm_card_visa \
   --alaka.mudra.trusted-keys.kid-1=<base64 X.509 Ed25519 public key of the mandate issuer> \
@@ -800,6 +879,43 @@ signed by the approving party (the user, or an approval service), never by the a
   and the quote is bound to the key. So an approval can authorise at most one intent; presenting it
   with another key fails with `InvalidQuote.MISMATCH`. No schema change was needed for this.
 
+### 8.2 Operations: metrics and stuck intents
+
+The service exposes `/actuator/health` and `/actuator/prometheus`, and nothing else from Actuator.
+`AlakaMetrics` exports:
+
+| Metric | Meaning | Alert when |
+|--------|---------|-----------|
+| `alaka_engine_serialization_failures_total{mode}` | Transactions retried or abandoned on `40001` | the rate climbs under `hardened-ssi`: hot-mandate contention |
+| `alaka_engine_deadlocks_total{mode}` | Transactions that hit `40P01` | above 0: it should not happen with the canonical lock order |
+| `alaka_engine_retries_exhausted_total{mode}` | Requests abandoned after the retry budget (answered 503) | above 0 |
+| `alaka_outbox_tasks{status}` | Recovery tasks per status | `DEAD_LETTER` above 0 |
+| `alaka_outbox_oldest_overdue_seconds` | Sweeper lag: how long the oldest due task has waited | more than a few sweep intervals: the sweeper is down or stuck |
+| `alaka_outbox_dead_letter_held_minor` | Budget held by open intents whose recovery is dead-lettered | above 0: capital is locked until the rail resolves |
+
+The outbox gauges read three aggregate queries at most once every five seconds, whatever the
+scrape rate.
+
+**What happens to a stuck intent.**
+
+1. The sweeper retries recovery with exponential backoff, up to `maxAttempts` (default 10).
+2. After that, the task becomes `DEAD_LETTER`. This is the alert signal, not abandonment. The
+   intent keeps its hold, because releasing budget while the rail may still charge would break I6.
+3. A dead letter is still resolved without an operator, in two ways:
+   - **Webhook.** A verified `payment_intent.succeeded` or `.canceled` webhook settles the intent
+     and completes the task.
+   - **Recheck.** Every `deadLetterRecheck` (default 15 minutes), the sweeper claims the task for
+     one more attempt. If the rail has reached a terminal state by then, the intent is settled.
+
+   `StripeWireIntegrationTest` covers both paths.
+4. Only a rail that never resolves needs a person. `outbox_tasks.last_error` records why the last
+   attempt failed.
+
+**Ports.** The compose stack publishes Postgres on 25432 and the Toxiproxy proxy port on 25433.
+Both are below 49152, because Windows reserves random ranges of the dynamic port range at boot;
+override them with `ALAKA_PG_HOST_PORT` / `ALAKA_TOXI_HOST_PORT`. None of the verification gates
+use host ports.
+
 ---
 
 ## 9. Boundaries and non-goals
@@ -825,10 +941,17 @@ signed by the approving party (the user, or an approval service), never by the a
 - **Loss is bounded, not eliminated.**
   - A compromised agent holding a valid mandate token, and approvals from a trusted approver, can
     spend up to `total_budget_minor` at allowlisted merchants. I1 makes that the worst case.
-  - A dead-lettered `processing` intent keeps its hold, so budget is locked, not lost, until someone
-    resolves it.
+  - A dead-lettered `processing` intent keeps its hold, so budget is locked, not lost, until the
+    rail resolves it. A webhook or the 15-minute recheck then settles it automatically (§8.2), and
+    `alaka_outbox_dead_letter_held_minor` shows how much is locked meanwhile. If the rail never
+    resolves, an operator has to; there is no tooling for that beyond the metric and the
+    `outbox_tasks.last_error` column.
   - Orphaned unconfirmed payment intents can accumulate on Stripe. They cannot charge, but nothing
     cancels them.
+- **Refinement is checked on sequential runs only (§4.4).** The claim that the implementation
+  follows the spec rests on the documented mapping and on the runs actually recorded, not on a
+  proof over all executions. Concurrent executions are checked against the invariants, not against
+  the spec's transitions.
 - **The formal results are for finite instances:** 2 or 3 keys, a budget of 10, and the amounts
   listed in §4.2. The model does not cover:
   - the 409/422 responses;
@@ -850,9 +973,10 @@ signed by the approving party (the user, or an approval service), never by the a
   sweeper.
 - **The latency figures are not a capacity measurement.** They come from a single Windows 11 laptop
   (Docker Desktop, WSL2) at 50 requests per run. No open-workload load test has been run.
-- **Operations are minimal.** The in-process sweeper is a loop. Several instances are safe, because
-  claims use `SKIP LOCKED` and leases, but there is no leader election, metrics export or
-  key-rotation tooling.
+- **Operations are basic.** Prometheus metrics exist (§8.2), and several sweeper instances are
+  safe, because claims use `SKIP LOCKED` and leases. There is no leader election, no tracing, no
+  dashboards or alert rules shipped, and no key-rotation tooling. The SSI retry rate is exported as
+  a counter, not a per-transaction distribution.
 
 ---
 
@@ -860,6 +984,7 @@ signed by the approving party (the user, or an approval service), never by the a
 
 ```
 spec/AlakaInFlight.tla               protocol specification; *.cfg safe, wide and unsafe configs
+spec/AlakaInFlightTrace.tla          trace validation: recorded runs must be behaviours of the spec
 spec/probes/                         14 reachability probes
 migrations/000_roles.sql             alaka_migrator / alaka_app, database-level revokes
 migrations/001_init_nidhi_ledger.sql ledger kernel, deferred triggers, [NIDHI-D1..D10]
@@ -872,7 +997,8 @@ src/main/java/dev/alaka/mudra/       MudraTokenSigner/Verifier, MudraMandateClai
                                      MudraQuoteClaims, MudraCodec, QuoteDriftEvaluator
 src/main/java/dev/alaka/yaksha/      PaymentRailPort, StripeHttpPaymentRail, StripeWebhookVerifier,
                                      StripeWebhookHandler, YakshaRecoverySweeper, SimulatedPaymentRail
-src/test/java/dev/alaka/property/    jqwik stateful suite, InvariantChecker
+src/test/java/dev/alaka/property/    jqwik stateful suite, InvariantChecker, trace validation
+                                     (TraceRefinementProperties, RefinementTracer, TraceValidator)
 src/test/java/dev/alaka/nidhi/       ConcurrencyStormTest
 src/test/java/dev/alaka/chaos/       ToxiproxyChaosTest
 src/test/java/dev/alaka/yaksha/      Stripe wire, webhook and sweeper tests, MockStripeServer

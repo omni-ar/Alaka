@@ -74,6 +74,11 @@ Runtime modes (`--mode=` / `alaka.mode`):
 | `hardened-pessimistic` | `READ COMMITTED` | `spend_mandates FOR SHARE`, then `mandate_balances FOR UPDATE`, then `payment_intents FOR UPDATE` (canonical order) | Writers on one mandate queue; no retries |
 | `hardened-ssi` | `SERIALIZABLE` | No explicit balance lock. Conflicts surface as `40001`; whole-transaction retry with exponential backoff and full jitter (≤ 100 attempts, 1 ms base, 64 ms cap) | Optimistic. Taking the lock too would make it the pessimistic mode at a higher isolation level |
 
+`hardened-pessimistic` is the default and the recommended mode. A mandate's balance row is a hot
+counter that every spend writes, and queuing on its row lock wastes no work, whereas SSI pays for
+the same contention in aborted transactions (section 6.2). `hardened-ssi` is kept as a measured
+comparison, and for deployments where `SERIALIZABLE` is mandated.
+
 The engine opens database work only inside `TransactionRunner.inTransaction` lambdas, which receive a
 connection and nothing else. Every rail call goes through `RailCallGuard`, which throws if a
 transaction is open on the calling thread. So the rule "never hold a transaction, connection or
@@ -196,6 +201,38 @@ The model was also checked for vacuity and for sensitivity to bugs (Milestone 1)
   a witness for every one. The witnessed states include `PROCESSING`, a rejected cancel, a partial
   capture with the remainder released, voids after a rail cancel, and a capture after revocation.
 - **Mutations:** seven mutations of the spec were each caught by a named invariant or property.
+
+### Trace validation: does the implementation refine the spec?
+
+Model checking says the protocol is safe; trace validation checks that the implementation follows
+it.
+
+1. **Record.** `TraceRefinementProperties` runs the real engine, against PostgreSQL 16 and the
+   simulated rail, through random jqwik action chains in both hardened modes.
+   `RefinementTracer` records the abstract state after every engine call, every rail call, the
+   departure of every confirm request, and every rail-side event the test drives.
+2. **Check.** TLC checks each run with `spec/AlakaInFlightTrace.tla`, which extends the unmodified
+   `AlakaInFlight`. The first state must satisfy `Init`, and every consecutive pair must satisfy
+   `[Next]_vars` with both bug flags `FALSE`. An illegal step leaves TLC without a successor, which
+   it reports as a deadlock naming the run and the step.
+
+The refinement mapping, documented field by field in `RefinementTracer`, has two deliberate
+abstractions:
+
+- A rail payment intent is visible only once the intent row has recorded it, because the spec
+  creates and records in one step.
+- A voided reservation that never had a payment intent maps to `CANCELED`.
+
+**Results.** In the final run, every recorded run in both modes was accepted. The pessimistic mode
+recorded 430 states over 12 runs, and SSI 450 states over 12. The runs reach
+`PROCESSING`, rejected cancels, partial captures, voids and revocation, and the test asserts that
+they do, so an empty run cannot pass.
+
+**Negative controls.** Two tampered copies of real runs, a one-unit budget leak and a void while
+the rail is `PROCESSING`, are each rejected by TLC at the tampered step.
+
+**Scope.** This covers sequential executions only. The concurrent storms and the chaos suite are
+checked against the invariants (`InvariantChecker`), not against the spec's transitions.
 
 ## 5. The ledger kernel (nidhi)
 
@@ -367,6 +404,19 @@ intent completes it. `YakshaRecoverySweeper.sweepOnce()` works in three steps:
 
 It also tests that the grace period is respected and that an expired lease is reclaimed.
 
+**Dead letters are an alert, not abandonment.** A dead-lettered intent keeps its hold (I6), and is
+still resolved without an operator in two ways:
+
+- **Webhook.** A verified `payment_intent.succeeded` / `.canceled` webhook settles it and completes
+  the task.
+- **Recheck.** Every `deadLetterRecheck` (default 15 minutes), the sweeper claims the task for one
+  more recovery attempt.
+
+`StripeWireIntegrationTest` dead-letters two `PROCESSING` intents. It resolves one by the recheck
+after the rail succeeds, and the other by a late `canceled` webhook. It also checks that
+`alaka_outbox_dead_letter_held_minor` reports the locked budget while they wait. Disabling the
+recheck makes that test fail.
+
 ### Network chaos (`ToxiproxyChaosTest`)
 
 A real Toxiproxy 2.12 container sits between the Stripe HTTP adapter and the mock Stripe server.
@@ -466,6 +516,17 @@ rules. JSON is snake_case.
 `AlakaHttpControllerTest` starts the real Spring Boot application against Postgres and the mock
 Stripe server, and drives these flows over HTTP.
 
+**Operations.** `/actuator/health` and `/actuator/prometheus` are the only Actuator endpoints
+exposed. `AlakaMetrics` exports:
+
+- engine counters per mode: `alaka_engine_serialization_failures_total`,
+  `alaka_engine_deadlocks_total` and `alaka_engine_retries_exhausted_total`;
+- recovery gauges: `alaka_outbox_tasks{status}`, `alaka_outbox_oldest_overdue_seconds` (sweeper
+  lag) and `alaka_outbox_dead_letter_held_minor` (capital locked by dead letters).
+
+The gauges read three aggregate queries, cached for five seconds. The README (§8.2) lists the
+alert conditions.
+
 ## 10. Scope and limitations
 
 What the evidence covers, and what it does not:
@@ -503,8 +564,10 @@ What the evidence covers, and what it does not:
   - A compromised agent with a valid mandate token and approvals from a trusted approver can still
     spend up to the mandate's budget at allowlisted merchants. I1 caps the damage at
     `total_budget_minor`.
-  - A dead-lettered `processing` intent keeps its hold, so budget stays locked until a human or a
-    later webhook resolves it. Locked, not lost.
+  - A dead-lettered `processing` intent keeps its hold, so budget stays locked until the rail
+    resolves it. A webhook or the 15-minute recheck then settles it automatically. Only a rail that
+    never resolves needs a person, and there is no tooling for that beyond the metric and
+    `outbox_tasks.last_error`.
   - Orphaned unconfirmed payment intents can accumulate on the rail. They can never charge, but
     nothing cancels them.
 - **The rail is a mock in every automated test.** `StripeTestModeLiveTest` exercises the real Stripe
@@ -535,7 +598,10 @@ What the evidence covers, and what it does not:
   milliseconds). The Milestone 1 attack suite still creates mandates with the column default
   `not_before = NOW()`, so it could in principle trip on this host.
 - **The in-process sweeper** (`alaka.recovery.sweep-interval`) is a simple loop. Several instances
-  are safe (`SKIP LOCKED`, leases), but there is no leader election and no metrics export.
+  are safe (`SKIP LOCKED`, leases), but there is no leader election, no tracing, and no shipped
+  dashboards or alert rules.
+- **Refinement is trace-validated on sequential runs only** (section 4). It rests on the documented
+  mapping and the runs recorded, not on a proof over all executions.
 
 ## 11. Reproducing everything
 
